@@ -1,3 +1,5 @@
+**Completely generated with Copilot using the Claude Sonnet 4 model**
+
 # Live Blueprint Collaboration Plugin
 
 A comprehensive Unreal Engine 5.5 Editor plugin that enables real-time collaborative Blueprint editing using Unreal's Multi-User Editing (MUE) system with advanced performance monitoring, visual feedback, and debugging capabilities.
