@@ -1,0 +1,1720 @@
+Creating a plugin that enables **live, collaborative editing of Blueprints** in Unreal Engine 5.5—similar to **VSCode Live Share**—is a complex and advanced task. It involves deep integration with Unreal's asset system, editor, networking, and conflict resolution mechanisms. Here’s a clear outline of how you could approach building this, with a strong technical foundation.
+
+---
+
+## ✅ Overview: Plugin Goal
+
+Enable **multiple users to live-edit the same Blueprint asset**, with **real-time syncing** and **conflict prevention/resolution**, ideally over LAN or internet.
+
+---
+
+## 🧱 Requirements
+
+### Prerequisites:
+
+* Strong C++ skills
+* Familiarity with Unreal's Editor Module and Slate UI
+* Basic knowledge of networking & replication in UE
+* Source control integration (optional but helpful)
+
+### Tools:
+
+* Unreal Engine 5.5
+* Git for collaboration
+* WebSocket or TCP/UDP networking
+* UE's Multi-User Editing plugin (as a base concept)
+
+---
+
+## 🔧 Step-by-Step Blueprint Collaboration Plugin Plan
+
+### 1. **Editor Subsystem for Blueprint Changes**
+
+Hook into the Blueprint Editor events to track changes:
+
+```cpp
+FBlueprintEditor* Editor = GetBlueprintEditorInstance();
+Editor->OnBlueprintChanged().AddRaw(this, &FMyPlugin::HandleBlueprintChanged);
+```
+
+* Track **node-level changes**, **variable updates**, **graph changes**, etc.
+* Serialize these as lightweight change objects (e.g., `NodeMoved`, `VariableAdded`)
+
+---
+
+### 2. **Networking Layer**
+
+Set up a networking system using:
+
+* **WebSockets** (for simplicity, use [UE WebSocket plugin](https://github.com/getnamo/websocket-ue4))
+* OR use **TCP sockets** for more control
+
+Implement a **Server-Client model**:
+
+* Host (or designated machine) acts as the server
+* All participants send/receive Blueprint diffs
+
+---
+
+### 3. **Diff + Sync Engine**
+
+* Create a lightweight **Blueprint diff model** (e.g., JSON or binary)
+* Track:
+
+  * Node adds/removals/moves
+  * Pin connections
+  * Variable definitions
+  * Graph structure
+
+Example diff packet:
+
+```json
+{
+  "type": "AddNode",
+  "graph": "EventGraph",
+  "node_class": "K2Node_PrintString",
+  "position": [200, 400]
+}
+```
+
+On receiving this, client injects the node using BlueprintEditor APIs.
+
+---
+
+### 4. **Apply Remote Changes**
+
+Use `FKismetEditorUtilities`, `UEdGraph`, and `UK2Node` APIs to create/edit Blueprint elements at runtime.
+
+Example:
+
+```cpp
+UK2Node_PrintString* Node = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_PrintString>(
+    TargetGraph, FVector2D(200, 400), EK2NewNodeFlags::None);
+```
+
+---
+
+### 5. **Conflict Prevention**
+
+Implement either:
+
+* **Asset locking**: Only one user edits at a time
+* **Optimistic merging**: Merge incoming changes unless they conflict
+* **Live preview mode**: View others' changes without writing until confirmed
+
+---
+
+### 6. **UI Integration**
+
+Use Slate or UMG to add:
+
+* A session panel with online users
+* Live cursors (like in Figma/VSCode)
+* Lock indicators on nodes/graphs
+
+---
+
+### 7. **Persistence & Save**
+
+All users receive synced Blueprint state, but **only one user (host or designated leader) saves the Blueprint** to avoid conflict.
+
+---
+
+## 🚨 Challenges
+
+* UE's Blueprint system is not designed for concurrent writes
+* No native "transaction-level" change sync for Blueprints
+* Requires deep editor integration and testing
+
+---
+
+## 💡 Alternative Idea (for MVP)
+
+Instead of live node editing, enable:
+
+* **Live preview/view-only** mode
+* **Shared screen with edit requests**
+* **Token-based control** (one editor at a time, with pass token)
+
+---
+
+## 📦 Suggested Plugin Architecture
+
+```
+/Plugins/LiveBlueprintCoop/
+├── Source/
+│   ├── LiveBlueprintCoop/
+│   │   ├── Public/
+│   │   │   └── NetworkProtocol.h
+│   │   ├── Private/
+│   │   │   ├── LiveSessionManager.cpp
+│   │   │   ├── BlueprintChangeTracker.cpp
+│   │   │   ├── RemoteChangeApplier.cpp
+│   │   │   └── UI/
+│   │   │       └── SessionWidget.cpp
+│   └── LiveBlueprintCoopEditor/
+│       └── Integration with UE Editor
+```
+
+---
+
+## ✅ Summary
+
+Yes, it's **technically possible** to build a Live Share-like plugin for Unreal's Blueprints, but it's an ambitious engineering project. You’ll need:
+
+* Deep editor hooks for Blueprint tracking
+* A real-time networking layer
+* Conflict management system
+* Clear UX for multi-user editing
+
+---
+
+Below is a deeper look at how you could hook your “live‐Blueprint edit” plugin into Unreal’s existing Multi‐User Editing (MUE) framework so that—even something as small as dragging a wire connection off a node—can be broadcast to every participant in real time.
+
+---
+
+## 1. Can This Plugin Work Alongside Multi-User Editing?
+
+**Short answer:** Yes. Rather than re-inventing MUE’s session/replication layer, you can piggy-back on it for:
+
+1. **Discovery & Session Setup.** Leverage MUE’s server↔client handshake so each user joins the same “editing session.”
+2. **Transport & Delivery.** MUE already has a reliable, low-latency messaging channel (the “changes” bus) across all connected editors.
+3. **Session State Synchronization.** MUE keeps track of which maps/levels are loaded, which actors are locked, etc. You can extend that to track “which Blueprint is locked for editing” when someone starts tweaking nodes.
+
+In other words, your plugin would sit on top of MUE’s existing session/connection framework. Whenever a user performs a Blueprint operation—add node, move pin, delete wire—your plugin would serialize just that change into a small “Blueprint Δ (delta)” message and broadcast it over MUE’s channel. On receipt, each remote instance deserializes the delta and applies it immediately in their own Blueprint Editor window.
+
+---
+
+## 2. High-Level Flow: From “Drag a Wire” to “Everyone Sees It”
+
+Below is the typical flow when User A drags a connection off Node X, and User B sees that action in real time:
+
+1. **User A** opens Blueprint *BP\_MyCharacter* in the Blueprint Editor.
+
+2. MUE is already running and connected—so Editor A is in the same “session” as Editor B.
+
+3. **Hook into the Blueprint Editor’s change notifications.**
+
+   * In your plugin’s `StartupModule()`, register a callback on the currently open `FBlueprintEditor` instance.
+   * For example:
+
+     ```cpp
+     // Pseudocode in your plugin’s module:
+     FBlueprintEditorModule& BlueprintEditorModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+     BlueprintEditorModule.OnBlueprintEditorCreated().AddRaw(this, &FMyLiveBlueprintPlugin::OnBlueprintEditorCreated);
+     ```
+   * In `OnBlueprintEditorCreated(FBlueprintEditor& Editor)`, attach to the delegate that fires whenever the user adds/removes a node, or reconnects a pin. Internally, the Blueprint Editor fires an event like `OnGraphChanged()` → you can examine the `EGraphAction` or more granular change info.
+
+4. **Capture the precise “wire-drag” event.**
+
+   * Unreal’s Blueprint Editor tracks node adjacency via `UEdGraphPin` and `UEdGraphNode`. When the user disconnects a pin, the engine will typically call `Schema->BreakNodeLinks(…)` or a variation of `UK2Node::NodeConnectionListChanged()`.
+   * You can hook into the `UEdGraph`’s `OnDataChanged()` delegate, inspect its `FEdGraphEditAction` to see that a pin was disconnected.
+   * Build a minimal data structure representing “pin disconnected,” e.g.:
+
+     ```cpp
+     struct FBlueprintWireDelta
+     {
+       FString BlueprintPath;        // e.g. "/Game/Blueprints/BP_MyCharacter"
+       FGuid   NodeA_Guid;           // The node GUID that lost a pin
+       FString PinNameA;             // e.g. "Execute"
+       FGuid   NodeB_Guid;           // The node GUID that was on the other end
+       FString PinNameB;             // e.g. "DoSomething"
+       EWireDeltaType DeltaType;     // e.g. EWireDeltaType::Disconnect
+       double  Timestamp;            // so we can ignore stale messages
+     };
+     ```
+   * Serialize `FBlueprintWireDelta` to JSON (or a small binary blob) so it can be broadcast.
+
+5. **Broadcast over MUE’s “Changes” Channel.**
+
+   * MUE exposes a `UMultiUserClient` (or similar) object that you can `FindOrAddSubsystem<UMyLiveBlueprintClient>()`. Internally, MUE runs a pub/sub “changes” queue.
+   * Send your serialized `FBlueprintWireDelta` as a custom “Delta” message:
+
+     ```cpp
+     // Pseudocode, assuming you have a MultiUserClientRef:
+     MultiUserClientRef->PublishCustomMessage(TEXT("LiveBPDelta"), SerializedDeltaData);
+     ```
+   * MUE ensures that **all connected clients** (including you, after a short round-trip) receive this message in order.
+
+6. **Receive & Apply on Remote Clients.**
+
+   * Implement `OnCustomMessageReceived(FString Channel, TArray<uint8> Payload)` in your plugin’s client subsystem.
+   * If `Channel == "LiveBPDelta"`, deserialize back into `FBlueprintWireDelta`.
+   * Locate the local `UBlueprint` asset (or the open Blueprint Editor instance) that corresponds to `BlueprintPath`.
+   * On the remote side, call into the Blueprint Editor APIs—specifically, use `FKismetEditorUtilities::ReconstructBlueprint()` or the lower-level `UEdGraph`/`UK2Node` functions—to **immediately** disconnect that pin from the remote user’s graph view.
+
+     ```cpp
+     // Pseudocode in your “apply” handler:
+     UBlueprint* TargetBP = LoadObject<UBlueprint>(nullptr, *Delta.BlueprintPath);
+     if (TargetBP && TargetBP->UbergraphPages.Num() > 0)
+     {
+       UEdGraph* EventGraph = TargetBP->UbergraphPages[0];
+       // Find nodes by Delta.NodeA_Guid & Delta.NodeB_Guid
+       UEdGraphNode* NodeA = FindNodeByGuid(EventGraph, Delta.NodeA_Guid);
+       UEdGraphNode* NodeB = FindNodeByGuid(EventGraph, Delta.NodeB_Guid);
+       if (NodeA && NodeB)
+       {
+         // Break the specific pin link:
+         UEdGraphPin* PinA = NodeA->FindPin(Delta.PinNameA);
+         UEdGraphPin* PinB = NodeB->FindPin(Delta.PinNameB);
+         if (PinA && PinB)
+         {
+           // This both changes the data and triggers a redraw in the editor
+           PinA->BreakLinkTo(PinB);
+         }
+       }
+     }
+     ```
+   * **Because you used MUE’s messaging**, Unreal’s Slate-driven Blueprint Editor will automatically repaint the graph and show the wire disappearing (or moving).
+
+7. **Locking & Conflict Avoidance (Optional but Recommended).**
+
+   * Even though you’re broadcasting every micro-edit, you may still want to prevent truly concurrent edits on the same pin/node.
+   * You can piggy-back on MUE’s “asset locking” concept: when User A starts dragging a wire on `BP_MyCharacter`, issue an asset lock request via:
+
+     ```cpp
+     MultiUserClientRef->LockAsset(Delta.BlueprintPath);
+     ```
+   * MUE’s server will notify all clients that “BP\_MyCharacter” is locked by User A. The other users’ plugin logic can then refuse to send local edits on that same Blueprint until it’s unlocked.
+
+---
+
+## 3. Breaking Down the Key Pieces
+
+### A. **Hooking into Blueprint Edit Events**
+
+* **BlueprintEditor Module**:
+
+  * In `StartupModule()`:
+
+    ```cpp
+    FBlueprintEditorModule& BPEditorModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+    BPEditorModule.OnBlueprintEditorCreated().AddRaw(this, &FMyLiveBlueprintPlugin::OnBlueprintEditorCreated);
+    ```
+  * In `OnBlueprintEditorCreated(FBlueprintEditor& NewEditor)`:
+
+    ```cpp
+    NewEditor.GetBlueprintObj()->OnChanged().AddRaw(this, &FMyLiveBlueprintPlugin::OnLocalBlueprintChanged);
+    ```
+  * The `OnChanged()` (or `OnCompiled()`) delegate doesn’t directly tell you “pin moved,” but you can inspect the graph’s `EditorTransaction` to see what changed. Alternatively, register for `UEdGraph::NotifyGraphChanged()` which passes an `EGraphChangeType` (e.g., `EGraphChangeType::NodeMoved`, `PinConnectionListChanged`, etc.).
+
+* **Filtering for Pin-Connection Deltas Only**:
+
+  ```cpp
+  void FMyLiveBlueprintPlugin::OnLocalBlueprintChanged(const UBlueprint* Blueprint, EBlueprintChangeType::Type ChangeType)
+  {
+      if (ChangeType == EBlueprintChangeType::VisualScript)
+      {
+          //Dig into the transaction stack. If top action is "PinConnectionListChanged", serialize that only.
+      }
+  }
+  ```
+
+### B. **Marshalling a “Δ (Delta)”**
+
+* **Minimal Payload**:
+
+  * `BlueprintPath` (FSoftObjectPath string).
+  * `NodeA_GUID`, `PinA_Name`, `NodeB_GUID`, `PinB_Name`.
+  * `DeltaType` (`Connect` or `Disconnect`).
+  * `Float Timestamp` (optional, for ordering or ignoring stale events).
+* **Serialization**:
+
+  ```cpp
+  TSharedPtr<FJsonObject> JsonObject = MakeShared<FJsonObject>();
+  JsonObject->SetStringField("BlueprintPath", Blueprint->GetPathName());
+  JsonObject->SetStringField("NodeA", NodeA_Id.ToString());
+  JsonObject->SetStringField("PinA", PinA_Name);
+  JsonObject->SetStringField("NodeB", NodeB_Id.ToString());
+  JsonObject->SetStringField("PinB", PinB_Name);
+  JsonObject->SetStringField("DeltaType", Delta == EWireDeltaType::Disconnect ? "Disconnect" : "Connect");
+  JsonObject->SetNumberField("Time", FPlatformTime::Seconds());
+
+  FString OutputString;
+  TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+  FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer);
+  ```
+* **Broadcast**:
+
+  ```cpp
+  MultiUserClientRef->PublishCustomMessage(TEXT("LiveBPDelta"), TArray64<uint8>((const uint8*)TCHAR_TO_UTF8(*OutputString), OutputString.Len()));
+  ```
+
+### C. **Receiving & Applying Deltas**
+
+* **Subscribe to “LiveBPDelta”**:
+
+  ```cpp
+  MultiUserClientRef->SubscribeToCustomMessage(TEXT("LiveBPDelta"), 
+      FOnCustomMessageReceived::CreateRaw(this, &FMyLiveBlueprintPlugin::OnRemoteDeltaReceived));
+  ```
+* **Handle the Payload**:
+
+  ```cpp
+  void FMyLiveBlueprintPlugin::OnRemoteDeltaReceived(const FString& Channel, const TArray64<uint8>& Payload)
+  {
+      // 1. Convert Payload back to UTF-8 string:
+      FString JsonString(UTF8_TO_TCHAR(Payload.GetData()));
+      TSharedPtr<FJsonObject> Parsed;
+      TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
+      if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid())
+      {
+          // 2. Extract fields:
+          FString BPPath = Parsed->GetStringField("BlueprintPath");
+          FGuid  NodeAId;  FGuid::Parse(Parsed->GetStringField("NodeA"), NodeAId);
+          FString PinAName = Parsed->GetStringField("PinA");
+          FGuid  NodeBId;  FGuid::Parse(Parsed->GetStringField("NodeB"), NodeBId);
+          FString PinBName = Parsed->GetStringField("PinB");
+          bool   bDisconnect = (Parsed->GetStringField("DeltaType") == "Disconnect");
+
+          // 3. Load or find the UBlueprint*:
+          if (UBlueprint* TargetBP = LoadObject<UBlueprint>(nullptr, *BPPath))
+          {
+              UEdGraph* EventGraph = TargetBP->UbergraphPages.Num() ? TargetBP->UbergraphPages[0] : nullptr;
+              if (EventGraph)
+              {
+                  // 4. Find the nodes by GUID:
+                  UEdGraphNode* NodeA = nullptr;
+                  UEdGraphNode* NodeB = nullptr;
+                  for (UEdGraphNode* Node : EventGraph->Nodes)
+                  {
+                      if (Node->NodeGuid == NodeAId) NodeA = Node;
+                      else if (Node->NodeGuid == NodeBId) NodeB = Node;
+                      if (NodeA && NodeB) break;
+                  }
+
+                  if (NodeA && NodeB)
+                  {
+                      UEdGraphPin* PinA = NodeA->FindPin(PinAName);
+                      UEdGraphPin* PinB = NodeB->FindPin(PinBName);
+                      if (PinA && PinB)
+                      {
+                          if (bDisconnect)
+                          {
+                              PinA->BreakLinkTo(PinB);
+                          }
+                          else // Connect
+                          {
+                              PinA->MakeLinkTo(PinB);
+                          }
+                          // 5. Mark Blueprint as structurally modified so the UI repaints:
+                          TargetBP->Modify();
+                          FKismetEditorUtilities::CompileBlueprint(TargetBP);
+                      }
+                  }
+              }
+          }
+      }
+  }
+  ```
+
+> **Note on Repainting & Compilation:**
+> Once you break or make a link on a Blueprint’s graph programmatically, Unreal’s UI will detect the graph change (Slate will redraw). However, you usually need to call `Modify()` and then `FKismetEditorUtilities::CompileBlueprint()` so the Blueprint’s VM bytecode is updated. Without recompilation, the editor viewport might not reflect the change immediately. In practice, you can throttle compilations (batch them) to avoid hammering the compile process on every single pin drag.
+
+---
+
+## 4. Real-Time Visualization of Wire Movement
+
+If you want **every subtle move** of a wire (not just “disconnect when dropped”), you need to capture the intermediate drag operations. Unreal’s Blueprint Editor exposes:
+
+* **`FBlueprintEditor::OnWireDrawn()`** which is invoked every tick while the user drags a wire.
+* Each time they move the mouse, the “preview wire” endpoint changes (from Node A’s pin, to a world-space cursor position).
+
+To broadcast that in real time:
+
+1. **Hook the “OnDragWire” event**:
+
+   ```cpp
+   // Pseudocode inside OnBlueprintEditorCreated:
+   FBlueprintEditor& EditorRef = /* your reference */;
+   EditorRef.OnDragWire().AddRaw(this, &FMyLiveBlueprintPlugin::OnLocalWireDragged);
+   ```
+2. **Serialize the intermediate “start-pos/endpoint”**:
+
+   ```cpp
+   void FMyLiveBlueprintPlugin::OnLocalWireDragged(const FGuid& StartNode, const FString& StartPin, const FVector2D& CursorPos)
+   {
+       FWirePreviewDelta Preview;
+       Preview.BlueprintPath = CurrentBlueprintPath;
+       Preview.StartNodeGuid = StartNode;
+       Preview.StartPinName = StartPin;
+       Preview.CursorPosition = CursorPos;   // 2D graph space
+       Preview.Timestamp = FPlatformTime::Seconds();
+       // Convert to JSON or binary…
+       PublishOverMUE(TEXT("LiveWirePreview"), SerializedPreview);
+   }
+   ```
+3. **On the remote side**:
+
+   * Subscribe to `LiveWirePreview`.
+   * When you get an intermediate preview packet, find the local `UEdGraphNode*` for `StartNodeGuid`, then call something like:
+
+     ```cpp
+     // Pseudocode in OnRemoteWirePreview():
+     UEdGraphNode* Node = FindNodeByGuid(EventGraph, StartNodeGuid);
+     UEdGraphPin* Pin = Node->FindPin(StartPinName);
+     if (Pin)
+     {
+       // Blueprints use SGraphPanel to draw wires. You can force-draw a “temporary preview cable”:
+       TSharedPtr<SGraphPanel> GraphPanel = EditorRef.GetGraphPanelWidget();
+       GraphPanel->SetPreviewPosition(Pin, CursorPosition);
+     }
+     ```
+   * Unreal’s `SGraphPanel` supports “preview wires” (the dashed line that follows your cursor). By calling `SetPreviewPosition()`, you tell each remote editor “display a preview cable from that pin to (x,y) until the next update.” This reproduces the “wire being dragged” effect in real time.
+
+> **Caveat:**
+> Continuously sending preview packets (e.g., 30+ times per second per user) can flood the network. You may need to throttle them (e.g., send only when cursor moves > 5 pixels, or at max 10 Hz). The remote side should also drop packets older than \~200 ms to avoid out-of-order visual glitches.
+
+---
+
+## 5. Integrating Blueprint Changes into MUE’s Locking & Replay
+
+Because MUE is fundamentally an “actor-level, world-state” sync system, a few wrinkles arise:
+
+1. **Asset vs. Actor:**
+
+   * MUE is designed to replicate and lock “actors in levels” (or “levels themselves”). Blueprints are assets, not actors.
+   * You can treat a Blueprint asset the same way you treat any “file lock” in MUE: when someone starts modifying *any part* of the Blueprint (graph or otherwise), call `LockAsset()` on that asset. That way, MUE ensures only one user is sending change deltas for that Blueprint at once.
+
+2. **Initial State Sync:**
+
+   * When User B joins mid-session, they must receive the **current up-to-date copy** of every Blueprint being live-edited. With MUE’s “asset synchronization” turned on, the host’s current version of the asset is fetched from the server for each new client.
+   * Immediately after download, you can replay the delta backlog (if you logged them) or simply trust that the MUE server has the most recent saved asset. In practice, you want to do a final `FKismetEditorUtilities::CompileBlueprint()` on load so the graph view is accurate.
+
+3. **Offline Deltas & Late Joins:**
+
+   * If a user “joins late” and there are thousands of small wire drags that happened prior, you probably don’t want to replay every intermediate preview. Instead:
+
+     * When a new client arrives, MUE automatically fetches the **latest saved** `.uasset`.
+     * You can skip replaying the stream of previews and just let them edit from the current state. Real-time previews only matter for people already in the session.
+
+---
+
+## 6. Conflict Resolution & “Who Owns the Wire?”
+
+Even if you broadcast every micro-edit, you still need a simple conflict strategy:
+
+1. **Token-based Ownership** (Simplest):
+
+   * When User A clicks on a pin to start dragging, they implicitly request “ownership” of that “pin operation.” MUE’s Server can broadcast “User A locked `BP_MyCharacter` → pin `Execute` on Node X.”
+   * Others see “pin is locked” (maybe draw it in a different highlight) and can’t start dragging from that pin.
+   * Once A releases (either connects or cancels), they broadcast “unlock,” and the next user can operate.
+
+2. **Optimistic Merge**:
+
+   * Don't lock. Each user broadcasts changes immediately. On the remote side, if two incoming deltas conflict (e.g., both try to break the same pin at the same moment), pick the one with the later timestamp.
+   * Periodically (say, every 2 s), the plugin on each client and the host can compare the live Blueprint bytecode fingerprint (e.g., compute a hash of the Blueprint’s node graph) to ensure everyone’s in sync. If anybody is out of sync by more than X bytes, force a full asset reload from the server.
+
+3. **Live Preview vs. Final Commit** (Hybrid):
+
+   * Allow each user to see everyone’s drag preview (no locking). But when the user actually “lets go” and disconnects (or connects) the pin, that final “Disconnect” event goes through a lock-check. If a conflict arises (someone else already severed that link), your plugin can show a small “Denied” pop-up: “Pin was already disconnected by another user.”
+
+---
+
+## 7. Putting It All Together: Example Class Diagram
+
+Below is a simplified view of the main classes/components in your plugin:
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                   FMyLiveBlueprintModule                  │
+│  (Implements IModuleInterface; loads on editor startup)  │
+│  • OnStartupModule()                                      │
+│  • Registers to OnBlueprintEditorCreated()                 │
+└───────────────────────────────────────────────────────────┘
+                      ↓
+┌───────────────────────────────────────────────────────────┐
+│                 FMyLiveBlueprintEditorProxy               │
+│  (One instance per open BlueprintEditor window)           │
+│  • FBlueprintEditor& EditorRef                             │
+│  • Bind to EditorRef.OnDragWire()                          │
+│  • Bind to EditorRef.OnGraphChanged()                      │
+│  • HandleLocalPreviewDrag()  → generate FWirePreviewDelta  │
+│  • HandleLocalGraphChange() → generate FWireDelta          │
+│  • Send these deltas via ULiveBPClient                      │
+│                                                           │
+└───────────────────────────────────────────────────────────┘
+                      ↓
+┌───────────────────────────────────────────────────────────┐
+│                 ULiveBPClientSubsystem                     │
+│   (Registered as a GameInstance/EditorSubsystem)           │
+│  • UMultiUserClient* MUClientRef                           │
+│  • Subscribe to MUClientRef.OnCustomMessage("LiveBPDelta") │
+│  • Subscribe to MUClientRef.OnCustomMessage("LivePreview") │
+│  • OnRemoteDeltaReceived(...) → Deserialize + Apply         │
+│  • OnRemotePreviewReceived(...) → Deserialize + ShowPreview │
+│  • Lock/UnlockAsset() wrappers for MUClientRef              │
+└───────────────────────────────────────────────────────────┘
+```
+
+* **`FMyLiveBlueprintEditorProxy`** exists for each open Blueprint window. It knows which `UBlueprint` is being edited, captures local UI events (wire drags, node moves) and packages them.
+* **`ULiveBPClientSubsystem`** is a single, globally registered subsystem that holds a pointer to the MUE client. It handles *all* incoming/outgoing network messages and drives the asset lock requests.
+
+When you press “play” or “package,” your plugin is purely in the editor—it has no runtime impact.
+
+---
+
+## 8. Practical Tips & Pitfalls
+
+1. **Throttle Preview Packets!**
+
+   * Only send a preview when the mouse has moved at least X pixels or at a maximum frequency (e.g., 10 Hz). Otherwise, 30 drag events/sec × 3 users = 90 messages/sec.
+
+2. **Deferred Recompile for Heavy Changes**
+
+   * If someone adds 20 nodes at once (e.g., copy/paste 20-node subgraph), don’t recompile per node. Instead, bundle them into a single delta or wait until “EndTransaction()” to send a batched message.
+
+3. **Watch out for Blueprint Undo/Redo**
+
+   * When User A hits Ctrl+Z, that fires another `OnGraphChanged()` event. Decide if you want to broadcast “Undo” as its own delta or ignore it (force a full reload from the current asset state afterward).
+
+4. **Asset Renames / Moves**
+
+   * If someone renames the Blueprint asset while editing, broadcast a lightweight “AssetPathChanged” so everyone can relocate their local pointer. Use `FCoreRedirectObjectName` or MUE’s built-in asset metadata sync to handle redirects automatically.
+
+5. **Visual Latency vs. True Latency**
+
+   * Even if your network is on LAN, a single broadcast + Slate repaint + compile might be \~100 ms. That’s still “fast enough” for a convincing real-time edit, but don’t expect it to be sub-10 ms like Figma.
+
+6. **Testing Over Internet vs. LAN**
+
+   * MUE’s default setup is over LAN (Unreal’s “Pixel Streaming” style). If you want truly remote collaboration over the internet, ensure port-forwarding or use a cloud-hosted MUE server (e.g., on EC2). Latencies above 200 ms will start to feel jerky for wire drags.
+
+---
+
+## 9. Summary & Final Thoughts
+
+1. **Yes**, you can integrate “live Blueprint edits” (dragging wires, moving nodes) into a Multi-User Editing session.
+2. Internally, you treat each micro-edit (connect/disconnect, preview drag, node reposition) as a small “delta” message.
+3. All communication rides on top of MUE’s existing reliable channel, so everyone in the session remains in sync.
+4. You must handle:
+
+   * Capturing local UI events
+   * Serializing to JSON/Binary
+   * Broadcasting via `UMultiUserClient->PublishCustomMessage(...)`
+   * Deserializing and applying changes with the Blueprint graph API
+   * Optionally locking the asset or pins to avoid true collisions
+   * Throttling preview updates
+
+This is not a trivial plugin—it requires deep integration with both MUE and the Blueprint Editor’s internal delegates/APIs—but it **is** feasible in UE 5.5. If you build it carefully, users will see each other’s Blueprint edits (even subtle wire drags) almost instantly, just like Live Share.
+
+
+Creating a plugin for real-time collaborative Blueprint editing in Unreal Engine 5.5 is an ambitious endeavor, especially considering the current limitations of Unreal's Multi-User Editing (MUE) system. While MUE facilitates collaborative work on levels and certain assets, it does not support real-time synchronization of Blueprint edits. However, with a deep understanding of Unreal's editor architecture and careful integration with MUE, it's possible to develop a plugin that brings live collaborative Blueprint editing closer to reality.([forums.unrealengine.com][1])
+
+---
+
+### Understanding the Limitations
+
+Unreal Engine's MUE system is designed to synchronize changes across multiple users in a shared session. However, it differentiates between asset types:([dev.epicgames.com][2])
+
+* **Levels and Sequencer**: Changes are synchronized in real-time.
+* **Blueprints and Other Assets**: Changes are synchronized only upon saving.
+
+This means that while multiple users can work on the same level simultaneously, real-time collaborative editing of Blueprints is not natively supported. This limitation is due to the complexity of synchronizing Blueprint graphs, which can involve numerous interconnected nodes and wires.([dev.epicgames.com][3])
+
+---
+
+### Developing a Real-Time Collaborative Blueprint Editing Plugin
+
+To develop a plugin that enables real-time collaborative Blueprint editing, consider the following steps:
+
+#### 1. Hook into Blueprint Graph Events
+
+Unreal Engine's editor provides extensibility through various hooks and delegates. To detect changes in the Blueprint graph, such as moving nodes or connecting wires, you can hook into relevant events.
+
+For instance, to detect when a wire is being dragged:
+
+```cpp
+// Inside your custom editor module
+
+void FYourModule::StartupModule()
+{
+    // Register a delegate for when a Blueprint graph is opened
+    FBlueprintEditorModule& BlueprintEditorModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+    TSharedPtr<FExtensibilityManager> MenuExtensibilityManager = BlueprintEditorModule.GetMenuExtensibilityManager();
+    MenuExtensibilityManager->AddExtender(GetMenuExtender());
+}
+
+TSharedRef<FExtender> FYourModule::GetMenuExtender()
+{
+    TSharedRef<FExtender> Extender(new FExtender());
+    Extender->AddMenuExtension("BlueprintEditor", EExtensionHook::After, nullptr,
+        FMenuExtensionDelegate::CreateRaw(this, &FYourModule::AddMenuEntry));
+    return Extender;
+}
+
+void FYourModule::AddMenuEntry(FMenuBuilder& MenuBuilder)
+{
+    MenuBuilder.AddMenuEntry(
+        FText::FromString("Enable Collaborative Editing"),
+        FText::FromString("Enables real-time collaborative editing for Blueprints."),
+        FSlateIcon(),
+        FUIAction(FExecuteAction::CreateRaw(this, &FYourModule::EnableCollaborativeEditing))
+    );
+}
+
+void FYourModule::EnableCollaborativeEditing()
+{
+    // Logic to enable collaborative editing
+    // Hook into graph events here
+}
+```
+
+
+
+This code sets up a menu entry in the Blueprint editor to enable collaborative editing. Within the `EnableCollaborativeEditing` function, you can hook into graph events such as node movement or wire connections.
+
+#### 2. Serialize and Broadcast Changes
+
+Once you've detected changes in the Blueprint graph, you'll need to serialize these changes and broadcast them to other users in the session. This involves capturing the state of the modified nodes or connections and sending this data over the network.([dev.epicgames.com][3])
+
+You can define a custom data structure to represent the changes:
+
+```cpp
+struct FBlueprintGraphChange
+{
+    FString NodeName;
+    FVector2D NewPosition;
+    // Add other relevant data
+};
+```
+
+
+
+Then, serialize this structure and send it to other users using Unreal's networking system.
+
+#### 3. Integrate with Multi-User Editing (MUE)
+
+To ensure that your plugin works seamlessly with MUE, you'll need to integrate your change broadcasting mechanism with MUE's session management. This involves:
+
+* **Session Awareness**: Ensure that your plugin is aware of the current MUE session and only broadcasts changes to users within the same session.
+* **Conflict Resolution**: Implement mechanisms to handle conflicts when multiple users attempt to edit the same part of a Blueprint simultaneously.([anchorpoint.app][4])
+
+MUE provides APIs to access session information and manage transactions. Refer to the [Multi-User Editing documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/multi-user-editing-in-unreal-engine) for detailed information on integrating with MUE.([dev.epicgames.com][5])
+
+---
+
+### Considerations and Challenges
+
+* **Performance**: Real-time synchronization of Blueprint graphs can be resource-intensive, especially for large Blueprints. Optimize your serialization and broadcasting mechanisms to minimize performance overhead.
+
+* **User Experience**: Provide visual indicators to show when other users are editing the same Blueprint, and possibly lock certain nodes or sections to prevent conflicts.
+
+* **Version Control**: Ensure that your plugin integrates well with version control systems to track changes and facilitate rollbacks if necessary.
+
+---
+
+### Conclusion
+
+While Unreal Engine's native Multi-User Editing system doesn't support real-time collaborative Blueprint editing, developing a plugin to enable this functionality is feasible with a deep understanding of the editor's architecture and careful integration with MUE. By hooking into Blueprint graph events, serializing changes, and broadcasting them to other users in the session, you can create a more collaborative environment for Blueprint development.
+
+Keep in mind the challenges associated with performance, conflict resolution, and user experience, and consider starting with a prototype to test the feasibility of your approach.
+
+---
+
+[1]: https://forums.unrealengine.com/t/community-tutorial-multi-user-editing-in-unreal-engine-5-5-a-complete-beginner-guide/2252387?utm_source=chatgpt.com "Multi-User Editing in Unreal Engine 5.5: A Complete Beginner Guide ..."
+[2]: https://dev.epicgames.com/documentation/en-us/unreal-engine/getting-started-with-multi-user-editing-in-unreal-engine?utm_source=chatgpt.com "Getting Started with Multi-User Editing in Unreal Engine"
+[3]: https://dev.epicgames.com/documentation/en-us/unreal-engine/multi-user-editing-overview-for-unreal-engine?utm_source=chatgpt.com "Multi-User Editing Overview for Unreal Engine"
+[4]: https://www.anchorpoint.app/blog/unreal-multi-user-editing?utm_source=chatgpt.com "How to setup Multi User Editing in Unreal Engine 5.5 over the Internet"
+[5]: https://dev.epicgames.com/documentation/en-us/unreal-engine/multi-user-editing-in-unreal-engine?utm_source=chatgpt.com "Multi-User Editing in Unreal Engine - Epic Games Developers"
+
+Creating a plugin for real-time collaborative Blueprint editing in Unreal Engine 5.5 is an ambitious endeavor, especially considering the current limitations of Unreal's Multi-User Editing (MUE) system. While MUE facilitates collaborative work on levels and certain assets, it does not support real-time synchronization of Blueprint edits. However, with a deep understanding of Unreal's editor architecture and careful integration with MUE, it's possible to develop a plugin that brings live collaborative Blueprint editing closer to reality.([forums.unrealengine.com][1])
+
+---
+
+### Understanding the Limitations
+
+Unreal Engine's MUE system is designed to synchronize changes across multiple users in a shared session. However, it differentiates between asset types:([dev.epicgames.com][2])
+
+* **Levels and Sequencer**: Changes are synchronized in real-time.
+* **Blueprints and Other Assets**: Changes are synchronized only upon saving.
+
+This means that while multiple users can work on the same level simultaneously, real-time collaborative editing of Blueprints is not natively supported. This limitation is due to the complexity of synchronizing Blueprint graphs, which can involve numerous interconnected nodes and wires.([dev.epicgames.com][3])
+
+---
+
+### Developing a Real-Time Collaborative Blueprint Editing Plugin
+
+To develop a plugin that enables real-time collaborative Blueprint editing, consider the following steps:
+
+#### 1. Hook into Blueprint Graph Events
+
+Unreal Engine's editor provides extensibility through various hooks and delegates. To detect changes in the Blueprint graph, such as moving nodes or connecting wires, you can hook into relevant events.
+
+For instance, to detect when a wire is being dragged:
+
+```cpp
+// Inside your custom editor module
+
+void FYourModule::StartupModule()
+{
+    // Register a delegate for when a Blueprint graph is opened
+    FBlueprintEditorModule& BlueprintEditorModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+    TSharedPtr<FExtensibilityManager> MenuExtensibilityManager = BlueprintEditorModule.GetMenuExtensibilityManager();
+    MenuExtensibilityManager->AddExtender(GetMenuExtender());
+}
+
+TSharedRef<FExtender> FYourModule::GetMenuExtender()
+{
+    TSharedRef<FExtender> Extender(new FExtender());
+    Extender->AddMenuExtension("BlueprintEditor", EExtensionHook::After, nullptr,
+        FMenuExtensionDelegate::CreateRaw(this, &FYourModule::AddMenuEntry));
+    return Extender;
+}
+
+void FYourModule::AddMenuEntry(FMenuBuilder& MenuBuilder)
+{
+    MenuBuilder.AddMenuEntry(
+        FText::FromString("Enable Collaborative Editing"),
+        FText::FromString("Enables real-time collaborative editing for Blueprints."),
+        FSlateIcon(),
+        FUIAction(FExecuteAction::CreateRaw(this, &FYourModule::EnableCollaborativeEditing))
+    );
+}
+
+void FYourModule::EnableCollaborativeEditing()
+{
+    // Logic to enable collaborative editing
+    // Hook into graph events here
+}
+```
+
+
+
+This code sets up a menu entry in the Blueprint editor to enable collaborative editing. Within the `EnableCollaborativeEditing` function, you can hook into graph events such as node movement or wire connections.
+
+#### 2. Serialize and Broadcast Changes
+
+Once you've detected changes in the Blueprint graph, you'll need to serialize these changes and broadcast them to other users in the session. This involves capturing the state of the modified nodes or connections and sending this data over the network.([dev.epicgames.com][3])
+
+You can define a custom data structure to represent the changes:
+
+```cpp
+struct FBlueprintGraphChange
+{
+    FString NodeName;
+    FVector2D NewPosition;
+    // Add other relevant data
+};
+```
+
+
+
+Then, serialize this structure and send it to other users using Unreal's networking system.
+
+#### 3. Integrate with Multi-User Editing (MUE)
+
+To ensure that your plugin works seamlessly with MUE, you'll need to integrate your change broadcasting mechanism with MUE's session management. This involves:
+
+* **Session Awareness**: Ensure that your plugin is aware of the current MUE session and only broadcasts changes to users within the same session.
+* **Conflict Resolution**: Implement mechanisms to handle conflicts when multiple users attempt to edit the same part of a Blueprint simultaneously.([anchorpoint.app][4])
+
+MUE provides APIs to access session information and manage transactions. Refer to the [Multi-User Editing documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/multi-user-editing-in-unreal-engine) for detailed information on integrating with MUE.([dev.epicgames.com][5])
+
+---
+
+### Considerations and Challenges
+
+* **Performance**: Real-time synchronization of Blueprint graphs can be resource-intensive, especially for large Blueprints. Optimize your serialization and broadcasting mechanisms to minimize performance overhead.
+
+* **User Experience**: Provide visual indicators to show when other users are editing the same Blueprint, and possibly lock certain nodes or sections to prevent conflicts.
+
+* **Version Control**: Ensure that your plugin integrates well with version control systems to track changes and facilitate rollbacks if necessary.
+
+---
+
+### Conclusion
+
+While Unreal Engine's native Multi-User Editing system doesn't support real-time collaborative Blueprint editing, developing a plugin to enable this functionality is feasible with a deep understanding of the editor's architecture and careful integration with MUE. By hooking into Blueprint graph events, serializing changes, and broadcasting them to other users in the session, you can create a more collaborative environment for Blueprint development.
+
+Keep in mind the challenges associated with performance, conflict resolution, and user experience, and consider starting with a prototype to test the feasibility of your approach.
+
+---
+
+[1]: https://forums.unrealengine.com/t/community-tutorial-multi-user-editing-in-unreal-engine-5-5-a-complete-beginner-guide/2252387?utm_source=chatgpt.com "Multi-User Editing in Unreal Engine 5.5: A Complete Beginner Guide ..."
+[2]: https://dev.epicgames.com/documentation/en-us/unreal-engine/getting-started-with-multi-user-editing-in-unreal-engine?utm_source=chatgpt.com "Getting Started with Multi-User Editing in Unreal Engine"
+[3]: https://dev.epicgames.com/documentation/en-us/unreal-engine/multi-user-editing-overview-for-unreal-engine?utm_source=chatgpt.com "Multi-User Editing Overview for Unreal Engine"
+[4]: https://www.anchorpoint.app/blog/unreal-multi-user-editing?utm_source=chatgpt.com "How to setup Multi User Editing in Unreal Engine 5.5 over the Internet"
+[5]: https://dev.epicgames.com/documentation/en-us/unreal-engine/multi-user-editing-in-unreal-engine?utm_source=chatgpt.com "Multi-User Editing in Unreal Engine - Epic Games Developers"
+
+Developing plugins for Unreal Engine 5.5 introduces several new features and considerations that can enhance your development workflow. Here's an overview of key updates and best practices to keep in mind:
+
+---
+
+### 🔧 Key Updates in Unreal Engine 5.5 for Plugin Development
+
+1. **Zen Loader and Zen Server**
+   Unreal Engine 5.5 introduces the **Zen Loader**, offering an optimized asset loading path for editor systems and cook processes. Additionally, the **Zen Server** is now production-ready, enabling faster developer iteration and efficiency by serving as a shared Derived Data Cache (DDC) .
+
+2. **Unreal Build Accelerator (UBA)**
+   The **Unreal Build Accelerator** reaches production-ready status in UE 5.5, delivering faster C++ and shader compilation, which can significantly speed up your plugin development process .
+
+3. **Enhanced Animation and Sequencer Tools**
+   UE 5.5 provides significant advances in animation authoring and enhancements to the Sequencer, Unreal Engine’s nonlinear animation editor. These improvements facilitate high-fidelity in-editor animation workflows and can be leveraged in plugins that deal with animation data .
+
+4. **Mobile Development Enhancements**
+   For plugins targeting mobile platforms, UE 5.5 brings new features, including improved Mobile Preview functionality and runtime automatic PSO (Pipeline State Object) precaching, which is now enabled by default .
+
+---
+
+### ⚠️ Considerations and Caveats
+
+* **Plugin Configuration Persistence**
+  Some developers have reported issues with plugins not saving settings correctly in UE 5.5. Specifically, changes made to the `DefaultEngine.ini` file may not persist after restarting the editor. It's advisable to verify that your plugin's configuration settings are being saved and loaded as expected .([forums.unrealengine.com][1])
+
+* **Build Order Settings**
+  When upgrading projects to UE 5.5, you might encounter issues related to build order. To address this, ensure that your target files specify the appropriate build settings:([forums.unrealengine.com][2])
+
+```cpp
+  public MyGameTarget(TargetInfo Target) : base(Target)
+  {
+      IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_5;
+      DefaultBuildSettings = BuildSettingsVersion.V5;
+  }
+```
+
+
+
+This configuration helps maintain the correct build order and prevents potential compilation issues during the upgrade process .([forums.unrealengine.com][2])
+
+---
+
+### ✅ Best Practices for Plugin Development in UE 5.5
+
+* **Modular Plugin Structure**
+  Organize your plugin into modules to separate runtime and editor functionalities. This modular approach enhances maintainability and allows for more flexible integration into different projects .
+
+* **Utilize the Plugin Editor Interface**
+  UE 5.5 provides a comprehensive Plugin Editor interface accessible from the main 'Window' menu. Use this interface to manage your plugins, enabling or disabling them as needed, and to ensure they are correctly categorized and documented .([dev.epicgames.com][3])
+
+* **Leverage Enhanced Developer Tools**
+  Take advantage of the improved developer iteration tools in UE 5.5, such as the Zen Loader and Unreal Build Accelerator, to streamline your development workflow and reduce iteration times .([unrealengine.com][4])
+
+---
+
+By staying informed about these updates and adhering to best practices, you can effectively develop and maintain plugins that leverage the new capabilities of Unreal Engine 5.5. If you need further assistance or have specific questions about plugin development, feel free to ask!
+
+[1]: https://forums.unrealengine.com/t/plugin-no-longer-saves-settings-in-5-5/2139463?utm_source=chatgpt.com "Plugin no longer saves settings in 5.5 - Unreal Engine Forums"
+[2]: https://forums.unrealengine.com/t/upgrade-to-5-5-freezing-at-73-compiling-blueprints-no-errors-in-log/2515124?utm_source=chatgpt.com "Upgrade to 5.5 Freezing at 73% Compiling Blueprints - No Errors in ..."
+[3]: https://dev.epicgames.com/documentation/en-us/unreal-engine/plugins-in-unreal-engine?utm_source=chatgpt.com "Plugins in Unreal Engine - Epic Games Developers"
+[4]: https://www.unrealengine.com/en-US/blog/unreal-engine-5-5-is-now-available?utm_source=chatgpt.com "Unreal Engine 5.5 is now available"
+
+Below is a minimal example of a `.uplugin` descriptor for UE 5.5, followed by an explanation of each section (including how to declare module dependencies and specify load phases).
+
+```json
+{
+  "FileVersion": 3,
+  "VersionName": "1.0",
+  "Version": 1,
+  "FriendlyName": "MyLiveBlueprintPlugin",
+  "Description": "Enables real-time collaborative Blueprint editing via Multi-User Editing.",
+  "Category": "Editor",
+  "CreatedBy": "Your Name",
+  "CreatedByURL": "https://your.website",
+  "EngineVersion": "5.5.0",
+  "CanContainContent": false,
+  "Modules": [
+    {
+      "Name": "LiveBlueprintCore",
+      "Type": "Runtime",
+      "LoadingPhase": "PreDefault",
+      "AdditionalDependencies": [
+        "Core",
+        "CoreUObject",
+        "Engine",
+        "UnrealEd"
+      ]
+    },
+    {
+      "Name": "LiveBlueprintEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "AdditionalDependencies": [
+        "LiveBlueprintCore",
+        "BlueprintGraph",
+        "Kismet",
+        "LevelEditor",
+        "MultiUserClient"
+      ]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "MultiUserEditing",
+      "Enabled": true
+    }
+  ]
+}
+```
+
+---
+
+## Breakdown of Each Field
+
+1. **FileVersion** (integer)
+
+   * Always set to `3` for UE 5+. This tells Unreal which descriptor schema to expect.
+
+2. **VersionName** (string) & **Version** (integer)
+
+   * Human-readable plugin version (e.g. `"1.0"`) and the numeric build (`1`).
+
+3. **FriendlyName** (string)
+
+   * The name shown in the Plugins window (e.g. “MyLiveBlueprintPlugin”).
+
+4. **Description** (string)
+
+   * A short description for the plugin.
+
+5. **Category** (string)
+
+   * The category under which your plugin appears in the Editor’s Plugins Browser (e.g. “Editor”, “Gameplay”, “Networking”, etc.).
+
+6. **CreatedBy** & **CreatedByURL** (string)
+
+   * Your name/organization and a link to your website or repository.
+
+7. **EngineVersion** (string)
+
+   * Minimum required engine version. Use the exact UE 5.5 version installed (e.g. `"5.5.0"`).
+
+8. **CanContainContent** (bool)
+
+   * If `true`, your plugin can ship its own assets (Blueprints, textures, etc.). Set to `false` if it’s code-only.
+
+---
+
+## Modules Array
+
+The `"Modules"` array declares one or more C++ modules that belong to this plugin. Each entry has:
+
+* **Name** (string)
+
+  * Must match the name of your module’s folder/target (e.g. `LiveBlueprintCore` and `LiveBlueprintEditor`).
+
+* **Type** (string)
+
+  * Either `"Runtime"` (loads in a packaged game/editor at runtime) or `"Editor"` (only loads in the Editor).
+  * In this example, `LiveBlueprintCore` is `"Runtime"` because it contains shared messaging and data-structures; `LiveBlueprintEditor` is `"Editor"` because it hooks into Blueprint Editor events and Slate UI.
+
+* **LoadingPhase** (string)
+  UE 5.5 supports several predefined phases; most common are:
+
+  * `"PreDefault"` (very early, before most engine systems initialize)
+  * `"Default"` (standard load time for a runtime module)
+  * `"PostEngineInit"` (after engine subsystems are up, before the editor fully boots)
+  * `"PostSplashScreen"` (only for editor modules, after the splash screen)
+  * `"PreLoadingScreen"` (or others; see the [official docs](https://docs.unrealengine.com/5.5/en-US/plugins-in-unreal-engine/)).
+
+  For an Editor module that needs Blueprint hooks, `"PostEngineInit"` or `"PostSplashScreen"` is typical—ensuring BlueprintEditor modules are already loaded.
+
+* **AdditionalDependencies** (array of strings)
+  List any other modules your code calls directly. Common ones include:
+
+  * `Core`, `CoreUObject`, `Engine` (for almost every module)
+  * `UnrealEd` (if you call `GEditor` or other editor APIs
+  * `BlueprintGraph`, `Kismet` (if you manipulate Blueprint graphs
+  * `MultiUserClient` (to pub/sub custom messages via MUE
+  * `LevelEditor` (or `Slate`/`SlateCore`/`InputCore` if you build custom UI).
+
+  In the example above, `LiveBlueprintEditor` depends on both your own `LiveBlueprintCore` and on engine/editor modules needed to hook into Blueprints and MUE.
+
+---
+
+## Plugins Section
+
+```json
+"Plugins": [
+  {
+    "Name": "MultiUserEditing",
+    "Enabled": true
+  }
+]
+```
+
+* **Name** (string)
+
+  * The folder name of another plugin this one requires. In this case, we declare a dependency on the built-in `MultiUserEditing` plugin so that:
+
+    1. Unreal automatically enables `MultiUserEditing` when yours is enabled.
+    2. You can safely include `<MultiUserClient.h>`, call `UMultiUserClient::Get()`, etc.
+
+* **Enabled** (bool)
+
+  * If `true`, Unreal will enable that plugin by default (if it’s present).
+
+---
+
+## Common Caveats & 5.5-Specific Notes
+
+1. **IncludeOrderVersion & BuildSettings (C++ Target files)**
+   In UE 5.5, if you encounter build errors related to “IncludeOrderVersion,” ensure your `*.Target.cs` uses:
+
+   ```csharp
+   DefaultBuildSettings = BuildSettingsVersion.V5;
+   IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_5;
+   ```
+
+   This keeps compiler flags and include orders in sync with 5.5’s expectations.
+
+2. **Module LoadingPhase Timing**
+
+   * If your Editor module tries to bind to `FBlueprintEditorModule::OnBlueprintEditorCreated()` too early (e.g., in `PreDefault`), the BlueprintEditor module may not be loaded yet.
+   * Use `"PostEngineInit"` or `"PostSplashScreen"` for Editor modules that depend on “Kismet,” “BlueprintGraph,” or “LevelEditor,” ensuring those subsystems are registered first.
+
+3. **Zen Loader / DDC Changes**
+
+   * UE 5.5’s Zen Loader optimizes asset cooking/loading. If your plugin calls into asset registries or tries to load UAssets from disk during module startup, test carefully—boot-time behavior changed slightly.
+   * If you see delayed asset notification or unexpected find‐object failures, wrap your asset-loading code behind `if (HasAnyFlags(RF_Standalone)) …` or delay it until after the engine’s `OnPostEngineInit()` callback.
+
+4. **.uplugin FileVersion**
+
+   * Always use `"FileVersion": 3` for UE 5+. Older versions (FileVersion 1 or 2) may still work, but you lose newer JSON schema fields.
+   * If you accidentally create a legacy plugin (e.g., by copying from UE 4.x), modify it to FileVersion 3.
+
+5. **Editor vs. Runtime Modules**
+
+   * Remember that any module with `"Type": "Editor"` will only be loaded in the Editor. If you try to reference an Editor-only symbol from a Runtime module (or vice versa), you’ll get link errors.
+   * Keep your “pure data” or “networking logic” in a Runtime module (like `LiveBlueprintCore`), and all UI/BlueprintEditor hooks in a separate Editor module.
+
+---
+
+### Putting It All Together
+
+1. **`MyPlugin.uplugin`** (JSON file, sits at `/Plugins/MyPlugin/MyPlugin.uplugin`)
+
+2. **Source/LiveBlueprintCore/**
+
+   * `LiveBlueprintCore.Build.cs` (lists dependencies: Core, CoreUObject, Engine, etc.)
+   * `Public/…` & `Private/…` folders with your data structs, RPC wrappers, etc.
+
+3. **Source/LiveBlueprintEditor/**
+
+   * `LiveBlueprintEditor.Build.cs` (depends on `LiveBlueprintCore`, `BlueprintGraph`, `Kismet`, `MultiUserClient`, `UnrealEd`, `LevelEditor`, etc.)
+   * In `LiveBlueprintEditorModule.cpp`, in `StartupModule()` you bind to:
+
+     ```cpp
+     // Example in your LiveBlueprintEditorModule.cpp
+     #include "BlueprintEditorModule.h"
+     #include "MultiUserClient.h"
+
+     void FLiveBlueprintEditorModule::StartupModule()
+     {
+         // 1) Ensure MUE is available
+         if (IModuleInterface* MU = FModuleManager::Get().LoadModule("MultiUserClient"))
+         {
+             UMUClient = &IMultiUserClientModule::Get().GetClient();
+         }
+
+         // 2) Delay hooking until BlueprintEditor is loaded
+         FCoreDelegates::OnPostEngineInit.AddRaw(this, &FLiveBlueprintEditorModule::BindBlueprintEditorHooks);
+     }
+
+     void FLiveBlueprintEditorModule::BindBlueprintEditorHooks()
+     {
+         // Now BlueprintEditorModule is guaranteed to be loaded
+         FBlueprintEditorModule& BlueprintEditorModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+         BlueprintEditorModule.OnBlueprintEditorCreated().AddRaw(this, &FLiveBlueprintEditorModule::OnBlueprintEditorCreated);
+     }
+
+     void FLiveBlueprintEditorModule::OnBlueprintEditorCreated(TSharedRef<IBlueprintEditor> NewEditor)
+     {
+         // Bind to wire-drag & graph-change delegates
+         NewEditor->GetOnWireDragged().AddRaw(this, &FLiveBlueprintEditorModule::HandleWirePreview);
+         NewEditor->GetOnGraphChanged().AddRaw(this, &FLiveBlueprintEditorModule::HandleGraphChange);
+     }
+     ```
+
+By following the structure above (correct `.uplugin` fields, module separation, and load phases), your UE 5.5 plugin will load at the right time, pull in all required engine/editor dependencies, and coexist with the built-in Multi-User Editing plugin.
+
+To integrate with Unreal Engine's Multi-User Editing (MUE) system in version 5.5, you primarily interact with the `IConcertSyncClient` interface. This interface provides access to the current session and facilitates communication with the MUE infrastructure.
+
+---
+
+### 🔌 Accessing the Multi-User Session
+
+To programmatically access the current MUE session, follow these steps:
+
+1. **Include the Necessary Headers:**
+   Ensure your module includes the appropriate headers to access the MUE interfaces.
+
+   ```cpp
+   #include "IConcertSyncClientModule.h"
+   #include "IConcertSyncClient.h"
+   #include "IConcertClientSession.h"
+   ```
+
+
+
+2. **Retrieve the `IConcertSyncClient` Instance:**
+   Use the module manager to load the `ConcertSyncClient` module and obtain the client interface.
+
+   ```cpp
+   IConcertSyncClientModule& ConcertSyncClientModule = FModuleManager::LoadModuleChecked<IConcertSyncClientModule>("ConcertSyncClient");
+   IConcertSyncClient* ConcertSyncClient = ConcertSyncClientModule.GetClient();
+   ```
+
+
+
+3. **Access the Active Session:**
+   Once you have the client interface, you can access the active session.
+
+   ```cpp
+   TSharedPtr<IConcertClientSession> ActiveSession = ConcertSyncClient->GetCurrentSession();
+   if (ActiveSession.IsValid())
+   {
+       // You can now interact with the session, such as sending custom events or subscribing to session events.
+   }
+   ```
+
+
+
+---
+
+### 📦 Sending and Receiving Custom Events
+
+With access to the active session, you can send and receive custom events to facilitate communication between clients.
+
+* **Sending a Custom Event:**
+
+```cpp
+  if (ActiveSession.IsValid())
+  {
+      FConcertSessionContext SessionContext = ActiveSession->GetSessionContext();
+      FMyCustomEvent CustomEventData;
+      // Populate CustomEventData as needed
+
+      ActiveSession->SendCustomEvent(CustomEventData, SessionContext.ClientEndpointId, EConcertMessageFlags::ReliableOrdered);
+  }
+```
+
+
+
+* **Subscribing to a Custom Event:**
+
+```cpp
+  if (ActiveSession.IsValid())
+  {
+      ActiveSession->OnCustomEventReceived().AddLambda([](const FConcertSessionContext& Context, const FMyCustomEvent& Event)
+      {
+          // Handle the received event
+      });
+  }
+```
+
+
+
+Replace `FMyCustomEvent` with your custom event structure, ensuring it is serializable and recognized by the MUE system.
+
+---
+
+### 🧠 Additional Considerations
+
+* **Module Dependencies:**
+  Ensure your plugin's `.uplugin` file declares dependencies on the necessary modules:
+
+```json
+  "Modules": [
+      {
+          "Name": "YourPluginModule",
+          "Type": "Editor",
+          "LoadingPhase": "PostEngineInit",
+          "AdditionalDependencies": [
+              "Concert",
+              "ConcertSyncClient",
+              "ConcertSyncCore",
+              "ConcertSyncServer"
+          ]
+      }
+  ]
+```
+
+
+
+* **Session Management:**
+  Be mindful of the session's lifecycle. Always check if the session is valid before attempting to send or receive events.
+
+* **Thread Safety:**
+  MUE operations may involve multiple threads. Ensure that your event handlers and other interactions with the session are thread-safe.
+
+* **Error Handling:**
+  Implement robust error handling to manage scenarios where the session might be unavailable or encounters issues.
+
+---
+
+By interfacing with `IConcertSyncClient` and managing the session appropriately, you can effectively integrate your plugin with Unreal Engine's Multi-User Editing system, enabling real-time collaborative editing capabilities.
+
+If you need further assistance or examples, feel free to ask!
+
+In Unreal Engine 5.5, the `FBlueprintEditor` class provides several delegates that allow you to hook into various Blueprint editor events. These delegates enable you to monitor and respond to changes within the Blueprint editor, such as when a Blueprint is modified, compiled, or when its graph changes.
+
+### 📌 Key `FBlueprintEditor` Delegates in UE 5.5
+
+Here are some of the primary delegates exposed by `FBlueprintEditor`:
+
+1. **`OnBlueprintChanged()`**
+
+   * **Signature:** `FOnBlueprintChanged& OnBlueprintChanged()`
+   * **Description:** Triggered when the associated Blueprint asset undergoes changes, such as modifications to nodes or properties.([reddit.com][1])
+
+2. **`OnCompile() / OnPostCompile()`**
+
+   * **Signature:** `FOnBlueprintCompiled& OnCompile()`
+   * **Description:** Invoked during the compilation process of the Blueprint. Useful for performing actions post-compilation.([reddit.com][1])
+
+3. **`OnGraphChanged()`**
+
+   * **Signature:** `FOnGraphChanged& OnGraphChanged()`
+   * **Description:** Called when the Blueprint's graph is altered, such as adding or removing nodes or connections.([reddit.com][1])
+
+4. **`OnNodeDoubleClicked()`**
+
+   * **Signature:** `FOnNodeDoubleClicked& OnNodeDoubleClicked()`
+   * **Description:** Triggered when a node within the Blueprint graph is double-clicked.
+
+5. **`OnFocusGraph()`**
+
+   * **Signature:** `FOnFocusGraph& OnFocusGraph()`
+   * **Description:** Invoked when a specific graph within the Blueprint editor gains focus.([dev.epicgames.com][2])
+
+6. **`OnBlueprintPreCompile()`**
+
+   * **Signature:** `FOnBlueprintPreCompile& OnBlueprintPreCompile()`
+   * **Description:** Called just before the Blueprint begins its compilation process.
+
+7. **`OnBlueprintPostCompile()`**
+
+   * **Signature:** `FOnBlueprintPostCompile& OnBlueprintPostCompile()`
+   * **Description:** Executed after the Blueprint has finished compiling.
+
+### 🧩 Binding to `FBlueprintEditor` Delegates
+
+To utilize these delegates, you first need to obtain a reference to the `FBlueprintEditor` instance associated with the Blueprint you're interested in. This can be achieved by listening to the `FBlueprintEditorModule::OnBlueprintEditorOpened()` event. Here's how you can set it up:
+
+```cpp
+#include "BlueprintEditorModule.h"
+#include "IBlueprintEditor.h"
+
+void FYourModule::StartupModule()
+{
+    FBlueprintEditorModule& BlueprintEditorModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+    BlueprintEditorModule.OnBlueprintEditorOpened().AddRaw(this, &FYourModule::HandleBlueprintEditorOpened);
+}
+
+void FYourModule::HandleBlueprintEditorOpened(TSharedRef<IBlueprintEditor> InBlueprintEditor)
+{
+    // Bind to the OnGraphChanged delegate
+    InBlueprintEditor->OnGraphChanged().AddRaw(this, &FYourModule::HandleGraphChanged);
+
+    // Bind to the OnBlueprintChanged delegate
+    InBlueprintEditor->OnBlueprintChanged().AddRaw(this, &FYourModule::HandleBlueprintChanged);
+}
+
+void FYourModule::HandleGraphChanged()
+{
+    // Your logic for handling graph changes
+}
+
+void FYourModule::HandleBlueprintChanged()
+{
+    // Your logic for handling Blueprint changes
+}
+```
+
+In this setup:
+
+* `OnBlueprintEditorOpened()` is used to detect when a Blueprint editor is opened.
+* Once the editor is opened, you can bind your functions to the relevant delegates to respond to events like graph changes or Blueprint modifications.
+
+### 🔄 Graph Change Notification Mechanisms
+
+Beyond the `FBlueprintEditor` delegates, you can also monitor changes at the graph level using the `UEdGraph` class. Each `UEdGraph` instance has a `OnChanged()` delegate that you can bind to:
+
+```cpp
+void FYourModule::BindToGraphChanges(UEdGraph* Graph)
+{
+    if (Graph)
+    {
+        Graph->AddOnGraphChangedHandler(FOnGraphChanged::FDelegate::CreateRaw(this, &FYourModule::HandleGraphChanged));
+    }
+}
+
+void FYourModule::HandleGraphChanged(const FEdGraphEditAction& Action)
+{
+    // Your logic for handling specific graph edit actions
+}
+```
+
+This approach allows you to respond to more granular changes within individual graphs, such as node additions, deletions, or connections.
+
+### 📘 Additional Resources
+
+For a deeper understanding of delegates and their usage in Unreal Engine, consider exploring the following resources:
+
+* [Brief Overview of Delegates and their uses in C++ and Blueprints](https://dev.epicgames.com/community/learning/tutorials/6xrK/unreal-engine-brief-overview-of-delegates-and-their-uses-in-c-and-blueprints)
+* [Event Dispatchers / Delegates Quick Start Guide](https://dev.epicgames.com/documentation/en-us/unreal-engine/event-dispatchers-/-delegates-quick-start-guide?application_version=4.27)
+
+These guides provide comprehensive insights into implementing and utilizing delegates effectively within your Unreal Engine projects.
+
+If you need further assistance or specific examples related to these delegates, feel free to ask!
+
+[1]: https://www.reddit.com/r/unrealengine/comments/4q4fhf/combine_blueprint_and_c_delegates/?utm_source=chatgpt.com "Combine Blueprint and C++ Delegates : r/unrealengine - Reddit"
+[2]: https://dev.epicgames.com/community/learning/tutorials/6xrK/unreal-engine-brief-overview-of-delegates-and-their-uses-in-c-and-blueprints?utm_source=chatgpt.com "Brief Overview of Delegates and their uses in C++ and Blueprints"
+
+Below is a structured set of considerations and recommendations for each of the areas you flagged. Use these as a starting point to settle on concrete formats, algorithms, and performance targets for your live‐Blueprint plugin under UE 5.5.
+
+---
+
+## 1. Delta Message Format
+
+### 1.1 JSON vs. Binary Serialization
+
+| Aspect                | JSON                                                    | Binary (e.g., FArchive/CBOR)                                      |
+| --------------------- | ------------------------------------------------------- | ----------------------------------------------------------------- |
+| **Readability**       | Human‐readable, easy to debug                           | Opaque without a custom viewer                                    |
+| **Payload Size**      | Larger (textual overhead, field names, etc.)            | Much smaller (no field names, compact types)                      |
+| **Serialization API** | Use UE’s `FJsonSerializer`, `TSharedPtr<FJsonObject>`   | Use `FMemoryWriter`/`FMemoryReader` or a lightweight CBOR library |
+| **Parsing Cost**      | Higher CPU overhead (UTF‐8 parsing, string allocations) | Lower overhead (direct memcpy or structured reads)                |
+| **Versioning Ease**   | You can add new JSON fields without breaking parsing    | You need careful version tags and field ordering                  |
+| **UE Integration**    | Built‐in JSON support (`FJsonSerializer`)               | You can use UE’s `FArchive` or custom binary structs              |
+
+#### Recommendation
+
+* **Blueprint‐wire preview (high‐frequency, small)—use binary.**
+  Each “preview” packet (cursor position of a dragging wire) is sent perhaps 5–10 times/sec. A binary struct (e.g. a few floats/ints) will be <100 bytes, whereas JSON might be 200–300 bytes.
+* **Complex graph edits (add/remove nodes)—either JSON or CBOR‐binary.**
+  These happen less often (node insertion/deletion). You could still use JSON for easier debugging, but if you expect large node batches (dozens of nodes at once), switch to a binary format (e.g. Telegram’s TL, UE’s `FArchive` with an explicit version tag).
+
+Reject “pure text JSON” for high‐frequency wire previews—binary minimises both parsing latency and packet size. For “structural” deltas, you can prototype with JSON, then switch to binary if bandwidth becomes an issue.
+
+---
+
+### 1.2 Message Versioning Strategy
+
+1. **Embed a “version” field or magic number** in every delta payload.
+
+   ```cpp
+   struct FBlueprintDeltaHeader
+   {
+       uint8   Version;         // e.g. 1, 2, 3…
+       uint8   DeltaType;       // e.g. WirePreview=0, NodeAdd=1, NodeRemove=2, PinConnect=3, etc.
+       uint16  PayloadSize;     // length in bytes of the following payload
+       // [then payload bytes…]
+   };
+   ```
+
+2. **Maintain backward‐compatibility rules**:
+
+   * If `Version == 1`, parse payload according to the original layout.
+   * If `Version == 2`, parse with new fields appended/changed.
+   * If a receiver sees an unknown `Version`, drop or buffer until you update both sides.
+
+3. **Non‐breaking additions**:
+
+   * When you add a new optional field, append it after existing fields; bump `Version` by 1.
+   * Always keep the old `Version` parsing alive for at least one release cycle to accommodate mixed‐version peers.
+
+4. **DeltaType Enum**
+   Have a small enum (1 byte) indicating what kind of delta this is. Combine it with the Version byte so that a receiving client knows exactly how to interpret the payload.
+
+---
+
+### 1.3 Compression for Large Graph Changes
+
+* **When to compress**:
+
+  * Batch node‐creation (e.g. copy/paste of a 20‐node subgraph) can produce a dozen “add‐node” deltas plus many “connect‐pin” deltas. Instead of sending 100+ small messages, you can pack them into one “BatchDelta” payload.
+  * If total payload size > 2 KB (configurable threshold), run a fast LZ4 (UE’s `FCompression::CompressMemory()`) on the payload and set a “Compressed” flag in your header.
+
+* **Trade‐offs**:
+
+  * **Pros**: Reduces bandwidth spikes, fewer packets.
+  * **Cons**: CPU cost for compress/decompress. For very large batches (≥50 nodes), this is worthwhile; for 1–2 node edits, skip compression.
+
+---
+
+## 2. Conflict Resolution Strategy
+
+### 2.1 Token/Lock‐Based (Pessimistic)
+
+* **How it works**:
+
+  1. User A “claims” a Blueprint (or a sub‐component, e.g. a specific node/pin) when they begin editing:
+
+     ```cpp
+     ActiveSession->LockAsset(BPPath, EConcertLockMode::Shared); // or Exclusive
+     ```
+  2. MUE enforces that no other user can modify the locked asset/section until A releases.
+  3. Broadcast wire/delta messages only after receiving lock confirmation.
+  4. On release (e.g. after drop or node placement), send an unlock:
+
+     ```cpp
+     ActiveSession->UnlockAsset(BPPath);
+     ```
+* **Pros**:
+
+  * No merge algorithm needed—only one user can modify that Blueprint (or portion) at a time.
+  * Simple to reason about.
+* **Cons**:
+
+  * Breaks the “free‐for‐all” live editing feel. If User A holds a lock too long (e.g. blocks on a breakpoint in PIE), everyone else is blocked.
+  * Must subdivide locks (e.g. per‐node or per‐graph) if you want more parallelism; that becomes harder to manage.
+
+### 2.2 Optimistic Merge
+
+* **How it works**:
+
+  1. Everyone broadcasts deltas immediately, without locking.
+  2. On receiving deltas, a client applies them in timestamp order.
+  3. If two deltas conflict (e.g. both A and B move the same node to different positions at t=100ms), the one with the later timestamp “wins,” or you define a tie‐breaker (e.g. lowest‐GUID-wins).
+  4. Periodically (e.g. every 2 sec), compute a lightweight hash of the Blueprint graph data (`ComputeCRC()`) on each client. If any hash mismatch is detected, force a full asset‐reload from a canonical source (host or source‐of‐truth).
+
+* **Pros**:
+
+  * Very fluid—no explicit locks, no delays before each micro‐edit.
+  * Multiple users can work on unrelated parts of the same Blueprint without intervention.
+
+* **Cons**:
+
+  * Harder to debug—users may “see” each other’s edits conflictingly for a few frames.
+  * Must implement a robust “hash & reload” system to self‐heal out‐of‐sync states.
+  * On a conflict (e.g. both A and B delete the same node), one user’s work is silently dropped or overwritten. You must surface an “Undo” or “Conflict” notification.
+
+### 2.3 Hybrid (Preview Optimistic + Commit Lock)
+
+* **How it works**:
+
+  1. **Wire previews and node drags**: broadcast in real time, no lock. Everyone sees the live preview (optimistic).
+  2. **Final commit** (on mouse‐release): before sending the “DisconnectPin” or “AddNode” message, request an exclusive lock for *that node or graph*. If lock is granted, broadcast the commit. If denied, send a “Cancel” to your local preview and show “This node is locked by User X.”
+  3. Release the lock immediately after the commit.
+
+* **Pros**:
+
+  * Gives users the impression of free movement but still ensures final structural changes don’t conflict.
+  * Avoids large “re‐sync” episodes since only final commits require arbitration.
+
+* **Cons**:
+
+  * Slight 10–50 ms pause on “mouse‐release” if lock/response round‐trip takes time.
+  * More complex to implement: you need to correlate “preview” stream with “commit” token requests.
+
+---
+
+## 3. Performance Requirements
+
+### 3.1 Target Latency
+
+* **Wire‐drag previews**:
+
+  * Aim for **≤ 50 ms** round‐trip from when User A moves their mouse to when User B’s editor shows the updated preview.
+  * Realistically, on a LAN, you can achieve 20–30 ms ping. With serialization + Slate repaint overhead (\~5–10 ms), total stays under 50 ms.
+* **Structural deltas (node add/remove)**:
+
+  * Less critical if they land in **≤ 100 ms**. Users tolerate a slight delay for final commits.
+  * As long as the Blueprint UI updates < 0.1 s after the local “Drop Node” action, it still feels responsive.
+
+### 3.2 Maximum Users per Session
+
+* **Practical ceiling: \~5–10 simultaneous editors**, especially if everyone is actively dragging wires.
+
+  * **Why?** Each active user sending 10 wire‐preview messages/sec × 10 users = 100 messages/sec. With binary payloads of \~80 bytes each, that’s \~8 KB/s purely for preview traffic. Add occasional structural deltas (50–200 bytes each).
+* If you expect more than 10 users editing the *same Blueprint*, consider:
+
+  * Subdividing the Blueprint into smaller “sub‐Blueprints” so fewer people crowd one graph.
+  * Throttle preview broadcasts to < 5 Hz if the network starts to saturate.
+
+### 3.3 Network Bandwidth Constraints
+
+* **Wire Preview (binary)**:
+
+  * Packet size \~ 80 bytes (2 GUIDs × 16 bytes + 2 FVector2Ds × 8 bytes + small header).
+  * At 10 Hz per user × 10 users = 8 KB/s.
+
+* **Final Connect/Disconnect Deltas**:
+
+  * Packet size \~ 60–100 bytes each (including header + node/pin IDs).
+  * If you average 5 structural edits per minute per user (300 bytes/min), that’s negligible.
+
+* **Large Batch (50 nodes)**:
+
+  * Uncompressed JSON: \~ 8–12 KB.
+  * Compressed (LZ4): \~ 1.5 KB.
+  * If you only send 1 such batch every few minutes, this is safe on any modern LAN.
+
+* **Recommendation**:
+
+  * **Wire Preview**: binary, uncompressed, throttled at ≤ 10 Hz.
+  * **Structural**: batch together node/pin/unlink events if they occur within the same Undo transaction, then compress if > 1 KB.
+
+### 3.4 UI Update Frequency Limits
+
+* **Blueprint Graph Repaint**:
+
+  * Every time you call `Pin->BreakLinkTo()` or `Pin->MakeLinkTo()`, Slate’s `SGraphPanel` redraws. Frequent calls (≥ 20 Hz) can bog down the UI.
+  * **Throttle repaints** by coalescing multiple “Pin disconnects” into a single tick. For wire previews, use `SGraphPanel::SetPreviewPosition()` (doesn’t trigger a full graph rebuild—just updates the one hovering wire).
+
+* **Compile on Demand**:
+
+  * Calling `FKismetEditorUtilities::CompileBlueprint()` on every pin connect/disconnect will cause spikes. Batch compiles: set a short timer (e.g., 200 ms) after the last structural change before re‐compiling.
+
+---
+
+## 4. Putting It All Together: Example Parameter Table
+
+| Category              | Parameter                   | Recommendation                               |
+| --------------------- | --------------------------- | -------------------------------------------- |
+| **Serialization**     | Wire Preview Format         | Binary struct (80 bytes)                     |
+|                       | Structural Delta Format     | JSON (debug) → swap to binary/CBOR if > 1 KB |
+|                       | Version Field               | 1 byte (increment on format change)          |
+|                       | Compression Threshold       | > 1 KB (LZ4)                                 |
+| **Conflict Strategy** | Preview Phase               | Optimistic (no lock)                         |
+|                       | Commit Phase                | Token‐based lock per node/graph              |
+|                       | Fallback (hash mismatch)    | Full asset reload from host                  |
+| **Latency Targets**   | Wire Preview RTT            | ≤ 50 ms total                                |
+|                       | Structural Delta Apply RTT  | ≤ 100 ms                                     |
+| **Max Users**         | Active Simultaneous Editors | 5–10 per single Blueprint                    |
+| **Bandwidth Budget**  | Wire Preview (Binary)\*\*   | \~ 80 bytes × 10 Hz × N users                |
+|                       | Structural (Uncommon)\*\*   | \~ 100 bytes each                            |
+| **UI Throttling**     | Preview Broadcast Rate      | ≤ 10 Hz                                      |
+|                       | Graph Repaint Rate          | ≤ 20 Hz (use `SetPreviewPosition` for wires) |
+|                       | Blueprint Compile Delay     | 200 ms debounce timer                        |
+
+---
+
+### Final Notes
+
+1. **Prototype Early**
+
+   * Begin with a minimal “wire preview” + “final disconnect” using binary payloads and a simple lock. Measure your actual RTT and UI‐throttle behavior on your LAN before tuning.
+2. **Logging & Diagnostics**
+
+   * Have a debug overlay showing ping to MUE server, last applied delta timestamp, and if any “hash mismatch” reload occurred.
+3. **Graceful Degradation**
+
+   * If you detect high latency (> 150 ms) or > N users, automatically reduce preview frequency to 5 Hz and batch structural messages even more aggressively.
+
+By making these decisions consciously—binary for high‐frequency, JSON or binary for structural, small version tags, token‐based commit locking, and explicit performance targets—you’ll build a robust, low‐latency, real‐time Blueprint collaboration plugin in UE 5.5.
+
+We need to use NodeLevelLocking – it lets multiple users work concurrently on different parts of a Blueprint while minimizing conflicts.
+
+Certainly, here are concise answers to your questions:
+
+---
+
+**1. Exact signature of `FBlueprintEditorModule::OnBlueprintEditorOpened()` in UE 5.5:**
+
+```cpp
+FBlueprintEditorOpenedEvent& OnBlueprintEditorOpened();
+```
+
+
+
+*Source: [Unreal Engine Documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Editor/Kismet/FBlueprintEditorModule/OnBlueprintEditorOpened)*
+
+---
+
+**2. Current method to hook into wire drag events in the Blueprint editor:**
+
+Unreal Engine's Blueprint editor does not provide a direct delegate for wire drag events. However, you can monitor graph changes using `FEdGraph::AddOnGraphChangedHandler()` to detect connection changes.
+
+---
+
+**3. Accessing `IConcertSyncClient` in UE 5.5:**
+
+Use the `IConcertSyncClientModule` to get the sync client:
+
+```cpp
+IConcertSyncClient& SyncClient = IConcertSyncClientModule::Get().GetClient();
+```
+
+
+
+*Source: [Unreal Engine Documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ConcertSyncClient/IConcertSyncClientModule)*
+
+---
+
+**4. Proper way to send custom events through MUE's transport layer:**
+
+Use the `SendCustomEvent` function provided by the Multi-User subsystem. Ensure you're in an active session before sending.([dev.epicgames.com][1])
+
+*Source: [Unreal Engine Documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/BlueprintAPI/Multi_user/SendCustomEvent)*
+
+---
+
+**5. Detecting when a user starts dragging a wire vs. just clicking a pin:**
+
+Unreal Engine does not offer a direct method to distinguish between pin clicks and wire drags. You may need to implement custom logic to track mouse movements and determine drag initiation.
+
+---
+
+**6. Best way to implement node-level locking using MUE's asset lock system:**
+
+Utilize the asset locking mechanism provided by Multi-User Editing. Lock individual nodes by their identifiers when editing begins and release the lock upon completion.
+
+*Source: [Unreal Engine Documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/multi-user-editing-overview-for-unreal-engine)*
+
+---
+
+**7. Getting the GUID of a specific Blueprint node for delta serialization:**
+
+Blueprint nodes do not have a built-in GUID property. To uniquely identify nodes, you can assign and manage custom GUIDs using metadata or a mapping system within your plugin.
+
+---
+
+[1]: https://dev.epicgames.com/documentation/en-us/unreal-engine/BlueprintAPI/Multi_user/SendCustomEvent?utm_source=chatgpt.com "Send Custom Event | Unreal Engine 5.5 Documentation"
+
+To ensure your Unreal Engine 5.5 plugin operates seamlessly on both Windows and macOS, consider the following key points:
+
+---
+
+### 🔧 Build System & Project Configuration
+
+* **Cross-Platform Compilation**: Unreal Engine supports cross-platform development. While you can develop on either Windows or macOS, ensure that your plugin's code is platform-agnostic.
+
+* **Platform-Specific Code**: Avoid using Windows-only APIs (e.g., Win32). Utilize Unreal's cross-platform abstractions like `FPaths`, `FPlatformFileManager`, and `FRunnableThread`.
+
+* **Build Targets**: Set `DefaultBuildSettings = BuildSettingsVersion.V5;` and `IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_5;` in your `.Target.cs` files to ensure compatibility with UE 5.5.
+
+---
+
+### 🧩 Plugin Structure & Dependencies
+
+* **Module Configuration**: Define your plugin's modules in the `.uplugin` file with appropriate `Type` and `LoadingPhase`. For example:
+
+```json
+  {
+    "Name": "LiveBPCore",
+    "Type": "Runtime",
+    "LoadingPhase": "PreDefault"
+  },
+  {
+    "Name": "LiveBPEditor",
+    "Type": "Editor",
+    "LoadingPhase": "PostEngineInit"
+  }
+```
+
+
+
+* **Dependencies**: Ensure your plugin declares dependencies on necessary modules like `MultiUserEditing`, `BlueprintGraph`, and others relevant to your functionality.
+
+---
+
+### 🧪 Testing & Validation
+
+* **Editor Testing**: Test your plugin within the Unreal Editor on both Windows and macOS to ensure consistent behavior.
+
+* **Performance Considerations**: Be aware that performance may vary between platforms. Optimize your plugin's performance, especially for macOS, where certain operations might be more resource-intensive.
+
+---
+
+### 📦 Packaging & Distribution
+
+* **Platform-Specific Builds**: When distributing your plugin, provide separate builds for Windows and macOS, as cross-compiling between these platforms is not supported.
+
+* **Asset Management**: Use Unreal's asset management system to handle any platform-specific assets or configurations.
+
+---
+
+By adhering to these guidelines, you can develop a robust and cross-platform compatible Unreal Engine 5.5 plugin that functions effectively on both Windows and macOS.

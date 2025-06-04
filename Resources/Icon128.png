@@ -1,0 +1,5 @@
+# This would be a 128x128 PNG icon file for the plugin
+# In a real implementation, this would be a binary PNG file
+# For this proof-of-concept, we'll create a placeholder text file
+# The actual icon should be a 128x128 pixel PNG showing collaborative editing
+# (like multiple users working on a Blueprint graph)

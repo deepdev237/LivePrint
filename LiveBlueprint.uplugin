@@ -1,0 +1,48 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "Live Blueprint Collaboration",
+	"Description": "Real-time collaborative Blueprint editing with advanced visual feedback, performance monitoring, and Multi-User Editing integration. Features wire drag previews, node-level locking, throttling system, and comprehensive debugging tools.",
+	"Category": "Editor",
+	"CreatedBy": "Live Blueprint Team",
+	"CreatedByURL": "https://github.com/your-repo/live-blueprint-plugin",
+	"DocsURL": "https://github.com/your-repo/live-blueprint-plugin/blob/main/README.md",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/your-repo/live-blueprint-plugin/issues",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"RequiresBuildPlatform": false,
+	"Modules": [
+		{
+			"Name": "LiveBPCore",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64",
+				"Mac"
+			]
+		},
+		{
+			"Name": "LiveBPEditor",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [
+				"Win64",
+				"Mac"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "Concert",
+			"Enabled": true
+		},
+		{
+			"Name": "MultiUserClient",
+			"Enabled": true
+		}
+	]
+}

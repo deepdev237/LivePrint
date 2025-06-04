@@ -1,0 +1,145 @@
+I am going to give all of this data to an other AI.
+This other AI will build the application.
+The plugin needs to run in Unreal Engine 5.5 Editor, just like Multi-User
+The plugin needs to work with Windows and Mac
+The plugin needs to work with Multi-User, adding on to its original functionalities, piggy-backing on MUE's existing transport
+The AI needs to know he can ask me to search the web for relevant info to get help building the plugin at any time.
+The AI always needs to write clean and understandable code.
+The AI needs to write the most optimal code.
+The AI needs to know this does not need to be a production ready plugin, a proof of concept is fine.
+The AI needs to know that I am in charge, If I feel like moving on to a production ready plugin, it will need to ignore the last statement and continue.
+The AI needs to be considerate of their actions and think about the bigger picture before working large parts of the code at once.
+
+You need to write a prompt for this AI.
+You need to tell the AI what to do and how to do it.
+Include everything and make every statement very clear.
+If you think something else is needed, tell me or ask me.
+
+
+
+---
+
+
+You are an AI engineer tasked with creating a **proof-of-concept Unreal Engine 5.5 Editor plugin** that enables real-time collaborative Blueprint editing by piggy-backing on Unreal’s existing Multi-User Editing (MUE) transport layer. Your deliverable will be clean, well-structured C++ code and any necessary Blueprint support. Follow these instructions exactly:
+There is nothing in the codebase as of right now, you are starting from scratch.
+
+---
+
+1. **Target Environment & Compatibility**
+
+   * The plugin must run inside **Unreal Engine 5.5 Editor** (not in packaged games).
+   * It must compile and operate on **Windows** and **Mac** without modification.
+   * It must load as an Editor-only plugin (just like the built-in Multi-User plugin).
+
+2. **MUE Integration Requirements**
+
+   * **Do not re-implement networking**. Instead, piggy-back on MUE’s existing session, transport, and message bus.
+   * Use the **IConcertSyncClient** (or the appropriate UE 5.5 MUE interface) to obtain the current session and to publish/subscribe custom RPCs or events.
+   * Ensure you enable and declare a dependency on the **MultiUserEditing** plugin in your `.uplugin` file so that MUE is loaded first.
+
+3. **Core Functionality**
+
+   * **Wire-drag Preview**: Whenever a user clicks and drags a Blueprint node’s pin, broadcast that preview cursor position to all other clients so they see the same preview wire in their graph.
+   * **Pin Connect/Disconnect**: When the user “releases” and completes a connection or severs a wire, send a final delta message that instructs all remote editors to replicate that connect or disconnect immediately.
+   * **Node Add/Delete/Move**: Detect when a node is added, deleted, or its position changed, then broadcast a minimal “delta” describing that change (node class, GUID, location, etc.) so other clients apply the same edit in real time.
+   * **Conflict Strategy**: Implement **NodeLevelLocking** (lock an individual node or pin while it’s actively being edited/dragged). Do not lock the entire Blueprint.
+
+     * When a user begins editing a node/pin, acquire a lock on just that node for the duration of the drag or edit.
+     * Broadcast lock-acquire and lock-release messages through MUE so that remote clients know not to apply simultaneous edits on the same node.
+   * **Versioning & Serialization**:
+
+     * Use a small **binary struct** for high-frequency wire previews (e.g., GUIDs + floats) to minimize packet size and latency.
+     * For structural changes (node add/delete, pin connect/disconnect), you may use **JSON** at first for readability, but include a **version byte** in every payload header so you can upgrade formats later.
+     * If a structural payload exceeds **1 KB**, compress it via UE’s built-in **LZ4** before sending; set a “compressed” flag in the header.
+
+4. **Plugin Structure & Module Configuration**
+
+   * Create two modules in your plugin folder:
+
+     1. **LiveBPCore** (Type = “Runtime”, LoadingPhase = “PreDefault”)
+
+        * Contains shared data types (delta structs, serialization utilities).
+        * Depends on: `Core`, `CoreUObject`, `Engine`, `ConcertSyncClient`, `ConcertSyncCore`.
+     2. **LiveBPEditor** (Type = “Editor”, LoadingPhase = “PostEngineInit”)
+
+        * Contains all code that hooks into the Blueprint Editor (Slate/EdGraph events).
+        * Depends on: `LiveBPCore`, `BlueprintGraph`, `Kismet`, `UnrealEd`, `LevelEditor`, `MultiUserClient`.
+   * Your `.uplugin` must specify both modules and declare a plugin dependency on **MultiUserEditing**.
+
+5. **Blueprint Editor Hook Points**
+
+   * In **LiveBPEditor::StartupModule()**, register a callback for when any Blueprint editor opens:
+
+     ```cpp
+     FBlueprintEditorModule& BPEditorModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+     BPEditorModule.OnBlueprintEditorOpened().AddRaw(this, &FLiveBPEditorModule::OnBlueprintEditorOpened);
+     ```
+   * In **OnBlueprintEditorOpened(TSharedRef<IBlueprintEditor> NewEditor)**, bind to:
+
+     1. `NewEditor->OnWireDragged()` → capture preview endpoints.
+     2. `NewEditor->OnGraphChanged()` → inspect `FEdGraphEditAction` for node add/delete/move, pin connect/disconnect.
+   * Use **UEdGraph**’s `AddOnGraphChangedHandler()` to get more granular events if needed.
+
+6. **MUE Custom Message Flow**
+
+   * **Publishing**:
+
+     ```cpp
+     TSharedPtr<IConcertClientSession> Session = IConcertSyncClientModule::Get().GetClient()->GetCurrentSession();
+     if (Session.IsValid()) {
+       Session->SendCustomEvent<FMyDeltaStruct>(DeltaInstance, Session->GetSessionContext().ClientEndpointId, EConcertMessageFlags::ReliableOrdered);
+     }
+     ```
+   * **Subscribing**:
+
+     ```cpp
+     Session->OnCustomEventReceived().AddRaw(this, &FLiveBPClient::OnRemoteDeltaReceived);
+     ```
+   * Use a small enum or `uint8` for **DeltaType** inside each message so the receiver knows how to dispatch (wire preview vs. connect vs. node add, etc.).
+
+7. **Cross-Platform Considerations**
+
+   * Stick to **standard UE5 APIs** (no platform-specific Windows-only code).
+   * If you need file paths or threading, use UE’s platform abstractions (e.g., `FPaths`, `FRunnableThread`).
+   * Build settings in your `*.Target.cs` must include:
+
+     ```csharp
+     DefaultBuildSettings = BuildSettingsVersion.V5;
+     IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_5;
+     ```
+
+8. **Performance & Throttling**
+
+   * **Wire Previews**: Send at max **10 Hz**. Only send when mouse moves >5 pixels.
+   * **Graph Repaints**: For preview wires, call `SGraphPanel::SetPreviewPosition()` instead of reconnecting pins each tick. This avoids a full graph recompile.
+   * **Compiling**: After a structural change (e.g., connect/disconnect or node add), wait **200 ms** before calling `FKismetEditorUtilities::CompileBlueprint()` to batch multiple edits.
+   * **User Limits**: Assume **5–10 users** editing the same Blueprint concurrently. If users >10, automatically throttle preview updates to 5 Hz.
+
+9. **Conflict Resolution**
+
+   * Implement **NodeLevelLocking**:
+
+     * On grab of a pin or node move, call `Session->LockAsset(BPPath, EConcertLockMode::Exclusive)` but annotate that you’re only locking this specific node/pin (you can maintain an in-memory map of “locked GUIDs”).
+     * On wire-drag preview, broadcast without lock; only on “mouse up” request the lock for final commit.
+     * If lock request is denied, send a “CancelPreview” event back to the original user so they know to abort their local change.
+   * Periodically compute a **CRC** of the Blueprint’s bytecode; if a mismatch is detected between clients, automatically reload the full asset from the MUE server.
+
+10. **Development Process & Communication**
+
+    * **You may ask me to Web search** for any additional reference (e.g., “exact signature of FBlueprintEditor::OnWireDragged in UE 5.5,” or “how to compress with LZ4 in UE”).
+    * Write **clean, self-documenting code**: use meaningful variable/class names, add comments explaining complex bits, and structure files logically under `Source/LiveBPCore/` and `Source/LiveBPEditor/`.
+    * **Think about the bigger picture** before coding large sections. For example, design all delta structs and wire synchronization logic before writing any serialization code.
+    * This is a **proof of concept**, not a production plugin. Keep code simple, focus on demonstrating real-time edits across two or more instances.
+    * If I later request “production-ready” enhancements, you may ignore the “proof of concept” constraint and expand accordingly.
+
+---
+
+### If Anything Is Unclear or You Need More Details:
+
+* Ask me directly.
+* You can request specific API references or example snippets.
+* You can ask to run a quick test (e.g., “Serialize a small delta and print its hex bytes”)—I can help with that.
+
+---
+
+Use these instructions as your guide. Produce all necessary `.uplugin`, `.Build.cs`, header and source files, and minimal example Blueprint events to validate functionality. Structure your answer/code so that another developer can clone, compile, and launch UE 5.5 Editor with live Blueprint collaboration enabled.
