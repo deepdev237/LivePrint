@@ -1598,17 +1598,11 @@ By making these decisions consciously—binary for high‐frequency, JSON or bin
 
 We need to use NodeLevelLocking – it lets multiple users work concurrently on different parts of a Blueprint while minimizing conflicts.
 
-Certainly, here are concise answers to your questions:
-
----
-
 **1. Exact signature of `FBlueprintEditorModule::OnBlueprintEditorOpened()` in UE 5.5:**
 
 ```cpp
 FBlueprintEditorOpenedEvent& OnBlueprintEditorOpened();
 ```
-
-
 
 *Source: [Unreal Engine Documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Editor/Kismet/FBlueprintEditorModule/OnBlueprintEditorOpened)*
 
@@ -1718,3 +1712,847 @@ To ensure your Unreal Engine 5.5 plugin operates seamlessly on both Windows and 
 ---
 
 By adhering to these guidelines, you can develop a robust and cross-platform compatible Unreal Engine 5.5 plugin that functions effectively on both Windows and macOS.
+
+THIS IS VERY IMPORTANT
+EVERYTHING BELOW THIS LINE IS THE KEY TO MAKING THIS WORK
+
+Here’s a detailed breakdown addressing your critical research areas for integrating with Unreal Engine 5.5’s Concert (Multi-User Editing) system:
+
+---
+
+### 1. Accessing `IConcertSyncClient` and Active Sessions in UE 5.5
+
+Your current approach using `IConcertSyncClientModule::Get().GetClient()` remains valid in UE 5.5. To retrieve the active session, you can use:
+
+```cpp
+TSharedPtr<IConcertClientSession> Session = IConcertSyncClientModule::Get().GetClient()->GetCurrentSession();
+```
+
+
+
+This method is consistent with the API documentation for [IConcertClient](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ConcertClient/IConcertClient).([dev.epicgames.com][1])
+
+---
+
+### 2. Broadcasting Custom Events via Concert
+
+To broadcast custom events to all session participants, utilize the `SendCustomEvent` function provided by the `IConcertSession` interface. The function signature is:([dev.epicgames.com][2])
+
+```cpp
+template<typename EventType>
+void SendCustomEvent(
+    const EventType& Event,
+    const TArray<FGuid>& DestinationEndpointIds,
+    EConcertMessageFlags Flags,
+    TOptional<FConcertSequencedCustomEvent> SequencedId = TOptional<FConcertSequencedCustomEvent>()
+);
+```
+
+
+
+For broadcasting to all participants, you can obtain the list of endpoint IDs from the session and pass them to this function. Ensure that your `EventType` is a serializable struct. Refer to the [SendCustomEvent documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/Concert/IConcertSession/SendCustomEvent) for more details.([dev.epicgames.com][2])
+
+---
+
+### 3. Declaring Concert Module Dependencies and Loading
+
+To ensure proper integration with Concert, declare the necessary module dependencies in your plugin's `.uplugin` file:([forums.unrealengine.com][3])
+
+```json
+"Modules": [
+  {
+    "Name": "YourPluginName",
+    "Type": "Editor",
+    "LoadingPhase": "PostEngineInit"
+  }
+],
+"Plugins": [
+  {
+    "Name": "ConcertSyncClient",
+    "Enabled": true
+  }
+]
+```
+
+
+
+This configuration ensures that your plugin loads after the engine initializes and that the `ConcertSyncClient` plugin is enabled. For more information, see the [IConcertSyncClientModule documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ConcertSyncClient/IConcertSyncClientModule).([dev.epicgames.com][4])
+
+---
+
+### 4. Implementing Node-Level Locking for Conflict Resolution
+
+Unreal Engine's Multi-User Editing system primarily supports asset-level locking. Node-level locking within Blueprints is not natively supported. To achieve granular locking, you'll need to implement a custom mechanism. This could involve:
+
+* Assigning unique identifiers to Blueprint nodes.
+* Tracking lock states for each node.
+* Broadcasting lock/unlock events using `SendCustomEvent`.
+* Enforcing lock states during editing operations.([reddit.com][5], [drupal.stackexchange.com][6])
+
+An example of a custom node-locking implementation can be found in this [Unreal Engine forum post](https://forums.unrealengine.com/t/my-first-engine-modification-blueprint-lock-node-feature/18555).([forums.unrealengine.com][7])
+
+---
+
+### 5. Managing Message Serialization and Performance
+
+When sending high-frequency data such as wire previews, it's crucial to manage message sizes and serialization efficiently. Consider the following strategies:
+
+* **Optimize Data Structures**: Use compact and efficient data representations to minimize message sizes.
+* **Throttle Message Frequency**: Implement rate-limiting to prevent overwhelming the network.
+* **Batch Updates**: Aggregate multiple changes into a single message when possible.
+* **Compression**: Apply compression techniques to reduce payload sizes.
+
+While specific serialization limits are not documented, adhering to these practices can help maintain performance. For further insights, refer to the [IConcertSession documentation](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/Concert/IConcertSession).([dev.epicgames.com][8])
+
+---
+
+### Additional Considerations
+
+* **Session Lifecycle Management**: Monitor session states and handle reconnections gracefully.
+* **Event Registration**: Ensure that custom event handlers are registered and unregistered appropriately to prevent memory leaks.
+* **Error Handling**: Implement robust error handling for network failures and serialization issues.([dev.epicgames.com][9])
+
+By addressing these areas, your Live Blueprint Collaboration Plugin can achieve seamless integration with Unreal Engine 5.5's Multi-User Editing system.
+
+[1]: https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ConcertClient/IConcertClient?utm_source=chatgpt.com "IConcertClient | Unreal Engine 5.5 Documentation"
+[2]: https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/Concert/IConcertSession/SendCustomEvent?utm_source=chatgpt.com "SendCustomEvent | Unreal Engine 5.5 Documentation"
+[3]: https://forums.unrealengine.com/t/plugin-dependent-on-another-plugin/387324?utm_source=chatgpt.com "Plugin dependent on another plugin - Unreal Engine Forums"
+[4]: https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ConcertSyncClient/IConcertSyncClientModule?utm_source=chatgpt.com "IConcertSyncClientModule | Unreal Engine 5.5 Documentation"
+[5]: https://www.reddit.com/r/unrealengine/comments/pr0llc/are_there_any_blueprint_nodes_that_have_more_than/?utm_source=chatgpt.com "Are there any blueprint nodes that have more than 1 \"trigger,\" input?"
+[6]: https://drupal.stackexchange.com/questions/36713/locking-nodes-or-entities-to-prevent-concurrent-editing?utm_source=chatgpt.com "Locking nodes or entities to prevent concurrent editing"
+[7]: https://forums.unrealengine.com/t/my-first-engine-modification-blueprint-lock-node-feature/18555?utm_source=chatgpt.com "My first Engine modification. Blueprint Lock Node feature - C++"
+[8]: https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/Concert/IConcertSession?utm_source=chatgpt.com "IConcertSession | Unreal Engine 5.5 Documentation"
+[9]: https://dev.epicgames.com/documentation/en-us/unreal-engine/BlueprintAPI/Multi_user?utm_source=chatgpt.com "Multi-user | Unreal Engine 5.5 Documentation"
+
+
+Concert
+Navigation
+
+API > API/Plugins
+Classes
+  	Type 	Name 	Description
+Public struct UStruct 	FConcertAdmin_ArchiveSessionRequest 	Create an archived copy of a live session. 	 
+Public struct UStruct 	FConcertAdmin_ArchiveSessionResponse 	  	 
+Public struct UStruct 	FConcertAdmin_BatchDeleteSessionRequest 	Deletes several archived and/or live sessions. 	 
+Public struct UStruct 	FConcertAdmin_BatchDeleteSessionResponse 	Answer by server 	 
+Public struct UStruct 	FConcertAdmin_CopySessionRequest 	Used to copy a live session or restore an archived one. 	 
+Public struct UStruct 	FConcertAdmin_CreateSessionRequest 	  	 
+Public struct UStruct 	FConcertAdmin_DeleteSessionRequest 	Delete an archived or live session. 	 
+Public struct UStruct 	FConcertAdmin_DeleteSessionResponse 	  	 
+Public struct UStruct 	FConcertAdmin_DiscoverServersEvent 	  	 
+Public struct UStruct 	FConcertAdmin_DropSessionRepositoriesRequest 	Drop one or more session repositories from the server, deleting all the contained files. 	 
+Public struct UStruct 	FConcertAdmin_DropSessionRepositoriesResponse 	  	 
+Public struct UStruct 	FConcertAdmin_FindSessionRequest 	  	 
+Public struct UStruct 	FConcertAdmin_GetAllSessionsRequest 	  	 
+Public struct UStruct 	FConcertAdmin_GetAllSessionsResponse 	  	 
+Public struct UStruct 	FConcertAdmin_GetArchivedSessionsRequest 	  	 
+Public struct UStruct 	FConcertAdmin_GetLiveSessionsRequest 	  	 
+Public struct UStruct 	FConcertAdmin_GetSessionActivitiesRequest 	  	 
+Public struct UStruct 	FConcertAdmin_GetSessionActivitiesResponse 	  	 
+Public struct UStruct 	FConcertAdmin_GetSessionClientsRequest 	  	 
+Public struct UStruct 	FConcertAdmin_GetSessionClientsResponse 	  	 
+Public struct UStruct 	FConcertAdmin_GetSessionRepositoriesRequest 	Returns the list of repositories known of the server. 	 
+Public struct UStruct 	FConcertAdmin_GetSessionRepositoriesResponse 	  	 
+Public struct UStruct 	FConcertAdmin_GetSessionsResponse 	  	 
+Public struct UStruct 	FConcertAdmin_MountSessionRepositoryRequest 	Mount a session repository used to store session files. 	 
+Public struct UStruct 	FConcertAdmin_MountSessionRepositoryResponse 	  	 
+Public struct UStruct 	FConcertAdmin_RenameSessionRequest 	Rename a session. 	 
+Public struct UStruct 	FConcertAdmin_RenameSessionResponse 	  	 
+Public struct UStruct 	FConcertAdmin_ServerDiscoveredEvent 	  	 
+Public struct UStruct 	FConcertAdmin_SessionInfoResponse 	  	 
+Public struct UStruct 	FConcertByteArray 	  	 
+Public struct UStruct 	FConcertClientInfo 	Holds info on a client connected through concert 	 
+Public struct 	FConcertClientInfoUpdate 	Contains the FConcertClientInfo fields that can be updated. 	 
+Public struct UStruct 	FConcertCustomVersionInfo 	Holds custom version information 	 
+Public struct UStruct 	FConcertEngineVersionInfo 	Holds engine version information 	 
+Public struct UStruct 	FConcertFileVersionInfo 	Holds file version information 	 
+Public struct UStruct 	FConcertInstanceInfo 	Holds info on an instance communicating through concert 	 
+Public struct UStruct 	FConcertLog 	  	 
+Public struct 	FConcertSequencedCustomEvent 	  	 
+Public class 	FConcertSequencedCustomEventManager 	Allows users to reserve a spot in the outbound queues. 	 
+Public struct UStruct 	FConcertServerInfo 	Holds info on a Concert server 	 
+Public struct UStruct 	FConcertSession_ClientListUpdatedEvent 	  	 
+Public struct UStruct 	FConcertSession_CustomEvent 	  	 
+Public struct UStruct 	FConcertSession_CustomRequest 	  	 
+Public struct UStruct 	FConcertSession_CustomResponse 	  	 
+Public struct UStruct 	FConcertSession_DiscoverAndJoinSessionEvent 	  	 
+Public struct UStruct 	FConcertSession_JoinSessionResultEvent 	  	 
+Public struct UStruct 	FConcertSession_LeaveSessionEvent 	  	 
+Public struct UStruct 	FConcertSession_SessionRenamedEvent 	  	 
+Public struct UStruct 	FConcertSession_UpdateClientInfoEvent 	  	 
+Public struct UStruct 	FConcertSessionClientInfo 	Holds information on session client 	 
+Public class 	FConcertSessionCommonImpl 	Common implementation for Concert Client and Server sessions (This doesn't inherit from any session interface, but does implement some of their API with a "Common" prefix on the function names. Interface implementations can also inherit from this common impl and then call the "Common" functions from the interface overrides. 	 
+Public struct 	FConcertSessionContext 	Context struct for session custom message handlers 	 
+Public class 	FConcertSessionCustomEventHandlerBase 	Common implementation of a session custom event handler. 	 
+Public struct UStruct 	FConcertSessionFilter 	Holds filter rules used when migrating session data 	 
+Public struct UStruct 	FConcertSessionInfo 	Holds info on a session 	 
+Public struct UStruct 	FConcertSessionRepositoryInfo 	Contains information about a session repository. 	 
+Public struct UStruct 	FConcertSessionSerializedPayload 	  	 
+Public struct UStruct 	FConcertSessionSettings 	  	 
+Public struct UStruct 	FConcertSessionVersionInfo 	Holds version information for a session 	 
+Public struct UStruct 	FDeletedSessionInfo 	  	 
+Public struct 	FInternalLiveSessionCreationParams 	  	 
+Public class 	IConcertClientSession 	Interface for Concert client sessions 	 
+Public class 	IConcertModule 	Interface for the Main Concert module. 	 
+Public class 	IConcertServerEventSink 	Interface for events that Concert server can emit 	 
+Public class 	IConcertServerSession 	Interface for Concert server sessions 	 
+Public class 	IConcertSession 	Interface for Concert sessions 	 
+Public class 	IConcertSessionCustomEventHandler 	Interface for session custom event handler 	 
+Public class 	IConcertSessionCustomRequestHandler 	Interface for session custom request handler 	 
+Public class 	IConcertSessionCustomResponseHandler 	Interface for session custom request handler TODO: replace by a generalized erased promise/future pair?? 	 
+Public class 	TConcertFunctionSessionCustomEventHandler 	Implementation of a session custom event handler that calls a function with the correct event type in the handler function signature. 	 
+Public class 	TConcertFunctionSessionCustomRequestHandler 	Implementation of a session custom request handler that calls a function with the correct request type in the handler function signature. 	 
+Public class 	TConcertFutureSessionCustomResponseHandler 	Implementation of a session custom response handler that uses a future to dispatch back the response 	 
+Public class 	TConcertRawSessionCustomEventHandler 	Implementation of a session custom event handler that uses a raw member function pointer with the correct event type in the handler function signature. 	 
+Public class 	TConcertRawSessionCustomRequestHandler 	Implementation of a session custom request handler that calls a raw member function with the correct request type in the handler function signature. 	 
+Typedefs
+Name 	Description
+FActivityID 	 
+FArchiveSession_WithSession 	 
+FArchiveSession_WithWorkingDir 	 
+FConcertClientLogEvent 	 
+FConcertServerLogEvent 	 
+FConcertTransportLoggingEnabledChanged 	 
+FCopySession 	 
+FExportSession 	 
+FLogListener 	 
+FOnArchivedSessionCreated 	 
+FOnArchivedSessionDestroyed 	 
+FOnArchivedSessionRenamed 	 
+FOnConcertClientSessionClientChanged 	 
+FOnConcertClientSessionConnectionChanged 	 
+FOnConcertClientSessionTick 	 
+FOnConcertServerSessionClientChanged 	 
+FOnConcertServerSessionTick 	 
+FOnConcertSessionRenamed 	 
+FOnLiveSessionCreated 	 
+FOnLiveSessionDestroyed 	 
+FOnLiveSessionRenamed 	 
+FRestoreSession 	 
+Enums
+  	Type 	Name 	Description
+Public enum UEnum 	EBatchSessionDeletionFlags 	  	 
+Public enum UEnum 	EConcertClientStatus 	Status for Concert session clients 	 
+Public enum UEnum 	EConcertCompressionDetails 	  	 
+Public enum UEnum 	EConcertConnectionResult 	Connection Result for Concert client session 	 
+Public enum UEnum 	EConcertConnectionStatus 	Connection status for Concert client sessions 	 
+Public enum UEnum 	EConcertLogMessageAction 	  	 
+Public enum UEnum 	EConcertPayloadCompressionType 	  	 
+Public enum UEnum 	EConcertPayloadSerializationMethod 	  	 
+Public enum UEnum 	EConcertSendReceiveState 	  	 
+Public enum UEnum 	EConcertServerFlags 	  	 
+Public enum UEnum 	EConcertSessionRepositoryMountResponseCode 	Response code returned when trying to mount a session repository on the server. 	 
+Public enum UEnum 	EConcertSessionResponseCode 	Response codes for a session custom request 	 
+Public enum UEnum 	EConcertSessionState 	  	 
+Public enum 	EConcertVersionValidationMode 	Modes that can be used when validating Concert version information 	 
+Functions
+  	Type 	Name 	Description
+Public function 	FArchiveSession_WithSession & 	
+
+ConcertServerEvents::ArchiveSession_WithSession ()
+	 
+Public function 	FArchiveSession_WithWorkingDir & 	
+
+ConcertServerEvents::ArchiveSession_WithWorkingDir ()
+	 
+Public function 	FCopySession & 	
+
+ConcertServerEvents::CopySession ()
+	 
+Public function 	FExportSession & 	
+
+ConcertServerEvents::ExportSession ()
+	 
+Public function 	FOnArchivedSessionCreated & 	
+
+ConcertServerEvents::OnArchivedSessionCreated ()
+	 
+Public function 	FOnArchivedSessionDestroyed & 	
+
+ConcertServerEvents::OnArchivedSessionDestroyed ()
+	 
+Public function 	FOnArchivedSessionRenamed & 	
+
+ConcertServerEvents::OnArchivedSessionRenamed ()
+	 
+Public function 	FOnLiveSessionCreated & 	
+
+ConcertServerEvents::OnLiveSessionCreated ()
+	 
+Public function 	FOnLiveSessionDestroyed & 	
+
+ConcertServerEvents::OnLiveSessionDestroyed ()
+	 
+Public function 	FOnLiveSessionRenamed & 	
+
+ConcertServerEvents::OnLiveSessionRenamed ()
+	 
+Public function 	FRestoreSession & 	
+
+ConcertServerEvents::RestoreSession ()
+	 
+Public function 	bool 	
+
+ConcertUtil::Copy ( FArchive& DstAr,
+FArchive& SrcAr,
+int64 Size
+)
+	Copy the specified data size from a source archive into a destination archive.
+Public function 	IConcertTransportLoggerRef 	
+
+ConcertUtil::CreateLogger ( const FConcertEndpointContext& InOwnerContext,
+FLogListener LogListenerFunc
+)
+	Factory function for use with FConcertTransportLoggerFactory
+Public function 	bool 	
+
+ConcertUtil::DeleteDirectoryTree ( const TCHAR* InDirectoryToDelete,
+const TCHAR* InMoveToDirBeforeDelete
+)
+	Delete a directory tree via a move and delete
+Public function 	void 	
+
+ConcertUtil::SetVerboseLogging ( bool bInState
+)
+	Turn on verbose logging for all loggers (including console loggers).
+Public function 	bool 	
+
+operator! ( EConcertCompressionDetails E
+)
+	 
+Public function 	bool 	
+
+operator! ( EConcertServerFlags E
+)
+	 
+Public function 	bool 	
+
+operator! ( EBatchSessionDeletionFlags E
+)
+	 
+Public function 	EBatchSessionDeletionFlags 	
+
+operator& ( EBatchSessionDeletionFlags Lhs,
+EBatchSessionDeletionFlags Rhs
+)
+	 
+Public function 	EConcertCompressionDetails 	
+
+operator& ( EConcertCompressionDetails Lhs,
+EConcertCompressionDetails Rhs
+)
+	 
+Public function 	EConcertServerFlags 	
+
+operator& ( EConcertServerFlags Lhs,
+EConcertServerFlags Rhs
+)
+	 
+Public function 	EBatchSessionDeletionFlags & 	
+
+operator&= ( EBatchSessionDeletionFlags& Lhs,
+EBatchSessionDeletionFlags Rhs
+)
+	 
+Public function 	EConcertCompressionDetails & 	
+
+operator&= ( EConcertCompressionDetails& Lhs,
+EConcertCompressionDetails Rhs
+)
+	 
+Public function 	EConcertServerFlags & 	
+
+operator&= ( EConcertServerFlags& Lhs,
+EConcertServerFlags Rhs
+)
+	 
+Public function 	EConcertCompressionDetails 	
+
+operator^ ( EConcertCompressionDetails Lhs,
+EConcertCompressionDetails Rhs
+)
+	 
+Public function 	EConcertServerFlags 	
+
+operator^ ( EConcertServerFlags Lhs,
+EConcertServerFlags Rhs
+)
+	 
+Public function 	EBatchSessionDeletionFlags 	
+
+operator^ ( EBatchSessionDeletionFlags Lhs,
+EBatchSessionDeletionFlags Rhs
+)
+	 
+Public function 	EConcertCompressionDetails & 	
+
+operator^= ( EConcertCompressionDetails& Lhs,
+EConcertCompressionDetails Rhs
+)
+	 
+Public function 	EConcertServerFlags & 	
+
+operator^= ( EConcertServerFlags& Lhs,
+EConcertServerFlags Rhs
+)
+	 
+Public function 	EBatchSessionDeletionFlags & 	
+
+operator^= ( EBatchSessionDeletionFlags& Lhs,
+EBatchSessionDeletionFlags Rhs
+)
+	 
+Public function 	EBatchSessionDeletionFlags 	
+
+operator| ( EBatchSessionDeletionFlags Lhs,
+EBatchSessionDeletionFlags Rhs
+)
+	 
+Public function 	EConcertCompressionDetails 	
+
+operator| ( EConcertCompressionDetails Lhs,
+EConcertCompressionDetails Rhs
+)
+	 
+Public function 	EConcertServerFlags 	
+
+operator| ( EConcertServerFlags Lhs,
+EConcertServerFlags Rhs
+)
+	 
+Public function 	EConcertCompressionDetails & 	
+
+operator|= ( EConcertCompressionDetails& Lhs,
+EConcertCompressionDetails Rhs
+)
+	 
+Public function 	EConcertServerFlags & 	
+
+operator|= ( EConcertServerFlags& Lhs,
+EConcertServerFlags Rhs
+)
+	 
+Public function 	EBatchSessionDeletionFlags & 	
+
+operator|= ( EBatchSessionDeletionFlags& Lhs,
+EBatchSessionDeletionFlags Rhs
+)
+	 
+Public function 	EConcertServerFlags 	
+
+operator~ ( EConcertServerFlags E
+)
+	 
+Public function 	EBatchSessionDeletionFlags 	
+
+operator~ ( EBatchSessionDeletionFlags E
+)
+	 
+Public function 	EConcertCompressionDetails 	
+
+operator~ ( EConcertCompressionDetails E
+)
+	 
+Public function 	bool 	
+
+UE::Concert::Compression::DataIsCompressed ( EConcertCompressionDetails InFormat
+)
+	Returns truen if the compression details is set to compressed format.
+Public function 	bool 	
+
+UE::Concert::Compression::DataIsCompressedWithOodle ( EConcertCompressionDetails InFormat
+)
+	Returns true if we are suppose to use Oodle for compression.
+Public function 	bool 	
+
+UE::Concert::Compression::DataIsUncompressed ( EConcertCompressionDetails InFormat
+)
+	Returns true if the compression details is set to uncompressed format.
+Public function 	FName 	
+
+UE::Concert::Compression::GetCompressionAlgorithm ( EConcertCompressionDetails InDetails
+)
+	Get the named compression algorithm based on the provided details.
+Public function 	FName 	
+
+UE::Concert::Compression::GetCompressionAlgorithm ()
+	Get the named compression algorithm to invoke with serializer and memory compressors.
+Public function 	EConcertCompressionDetails 	
+
+UE::Concert::Compression::GetCompressionDetails ( SizeType DataSize
+)
+	Based on the data size return the current compression details to store.
+Public function 	ECompressionFlags 	
+
+UE::Concert::Compression::GetCompressionFlags ()
+	Get the default flags to use when invoking the compressor.
+Public function 	EConcertCompressionDetails 	
+
+UE::Concert::Compression::GetCompressionFlags ( EConcertCompressionDetails InFormat
+)
+	Add in the compression flags to the concert compression details enum.
+Public function 	EConcertCompressionDetails 	
+
+UE::Concert::Compression::GetCompressionFromNamedType ( FName NamedMethod,
+ECompressionFlags Flags
+)
+	For a given named compression algorithm and compression flags convert it into a EConcertCompressionDetails
+Public function 	ECompressionFlags 	
+
+UE::Concert::Compression::GetCoreCompressionFlags ( EConcertCompressionDetails InFormat
+)
+	Get the compression enum value given the concert compression settings.
+Public function 	bool 	
+
+UE::Concert::Compression::ShouldCompress ( SizeType DataSize
+)
+	Based on the size of the data to compress indicate if we should invoke the compressor.
+
+
+
+Navigation
+
+API > API/Plugins > API/Plugins/Concert
+Inheritance Hierarchy
+
+    IConcertSession
+    IConcertClientSession
+    IConcertServerSession
+
+References
+  	 
+Module 	Concert
+Header 	/Engine/Plugins/Developer/Concert/ConcertMain/Source/Concert/Public/IConcertSession.h
+Include 	#include "IConcertSession.h"
+Syntax
+
+class IConcertSession  
+
+Remarks
+
+Interface for Concert sessions
+Destructors
+  	Type 	Name 	Description
+Public function Virtual 	  	
+
+~IConcertSession ()
+	 
+Functions
+  	Type 	Name 	Description
+Public function 	void 	
+
+ClearCustomEventHandler ()
+	Clear a custom event handler for this session
+Public function Const 	bool 	
+
+FindSessionClient ( const FGuid& EndpointId,
+FConcertSessionClientInfo& OutSessionClientInfo
+)
+	Find the the client for the specified endpoint ID
+Public function Const 	FConcertScratchpadPtr 	
+
+GetClientScratchpad ( const FGuid& ClientEndpointId
+)
+	Get the scratchpad associated with the given client ID.
+Public function Const 	const FGuid & 	
+
+GetId ()
+	 
+Public function Const 	const FString & 	
+
+GetName ()
+	 
+Public function Const 	FConcertScratchpadRef 	
+
+GetScratchpad ()
+	Get the scratchpad associated with this concert session.
+Public function Const 	TArray< FGuid > 	
+
+GetSessionClientEndpointIds ()
+	Get the list of connected client endpoint IDs
+Public function Const 	TArray< FConcertSessionClientInfo > 	
+
+GetSessionClients ()
+	Get the information about all connected clients
+Public function Const 	const FConcertSessionInfo & 	
+
+GetSessionInfo ()
+	 
+Public function Const 	FString 	
+
+GetSessionWorkingDirectory ()
+	Give the working directory for this session
+Protected function 	void 	
+
+InternalClearCustomEventHandler ( const FName& EventMessageType
+)
+	Clear a custom event handler for this session
+Protected function 	FDelegateHandle 	
+
+InternalRegisterCustomEventHandler ( const FName& EventMessageType,
+const TSharedRef< IConcertSessionCustomEventHandler >& Handler
+)
+	Register a custom event handler for this session
+Protected function 	void 	
+
+InternalRegisterCustomRequestHandler ( const FName& RequestMessageType,
+const TSharedRef< IConcertSessionCustomRequestHandler >& Handler
+)
+	Register a custom request handler for this session
+Protected function 	void 	
+
+InternalSendCustomEvent ( const UScriptStruct* EventType,
+const void* EventData,
+const TArray< FGuid >& DestinationEndpointIds,
+EConcertMessageFlags Flags,
+TOptional< FConcertSequencedCustomEvent > InSequenceId
+)
+	Send a custom event event to the given endpoints
+Protected function 	void 	
+
+InternalSendCustomRequest ( const UScriptStruct* RequestType,
+const void* RequestData,
+const FGuid& DestinationEndpointId,
+const TSharedRef< IConcertSessionCustomResponseHandler >& Handler
+)
+	Send a custom request to the given endpoint
+Protected function 	void 	
+
+InternalUnregisterCustomEventHandler ( const FName& EventMessageType,
+const FDelegateHandle EventHandle
+)
+	Unregister a custom event handler for this session
+Protected function 	void 	
+
+InternalUnregisterCustomEventHandler ( const FName& EventMessageType,
+const void* EventHandler
+)
+	 
+Protected function 	void 	
+
+InternalUnregisterCustomRequestHandler ( const FName& RequestMessageType
+)
+	Unregister a custom request handler for this session
+Public function 	FDelegateHandle 	
+
+RegisterCustomEventHandler ( typename TConcertFunctionSessionCustomEventHandler< EventType >::FFuncType Func
+)
+	Register a custom event handler for this session
+Public function 	FDelegateHandle 	
+
+RegisterCustomEventHandler ( HandlerType* Handler,
+typename TConcertRawSessionCustomEventHandler< EventType, HandlerType >::FFuncType Func
+)
+	Register a custom event handler for this session
+Public function 	void 	
+
+RegisterCustomRequestHandler ( typename TConcertFunctionSessionCustomRequestHandler< RequestType, ResponseType >::FFuncType Func
+)
+	Register a custom request handler for this session
+Public function 	void 	
+
+RegisterCustomRequestHandler ( HandlerType* Handler,
+typename TConcertRawSessionCustomRequestHandler< RequestType, ResponseType, HandlerType >::FFuncType...
+)
+	Register a custom request handler for this session
+Public function 	void 	
+
+SendCustomEvent ( const EventType& Event,
+const FGuid& DestinationEndpointId,
+EConcertMessageFlags Flags,
+TOptional< FConcertSequencedCustomEvent > SequencedId
+)
+	Send a custom event event to the given endpoint
+Public function 	void 	
+
+SendCustomEvent ( const EventType& Event,
+const TArray< FGuid >& DestinationEndpointIds,
+EConcertMessageFlags Flags,
+TOptional< FConcertSequencedCustomEvent > SequencedId
+)
+	Send a custom event event to the given endpoints
+Public function 	TFuture< ResponseType > 	
+
+SendCustomRequest ( const RequestType& Request,
+const FGuid& DestinationEndpointId
+)
+	Send a custom request to the given endpoint
+Public function 	void 	
+
+Shutdown ()
+	 
+Public function 	void 	
+
+Startup ()
+	 
+Public function 	void 	
+
+UnregisterCustomEventHandler ( const FDelegateHandle EventHandle
+)
+	Unregister a custom event handler for this session
+Public function 	void 	
+
+UnregisterCustomEventHandler ( HandlerType* EventHandler
+)
+	Unregister a custom event handler for this session
+Public function 	void 	
+
+UnregisterCustomRequestHandler ()
+	Unregister a custom request handler for this session
+
+
+IConcertClientSession
+
+Interface for Concert client sessions
+Navigation
+
+API > API/Plugins > API/Plugins/Concert
+Inheritance Hierarchy
+
+    IConcertSession
+    IConcertClientSession
+
+References
+  	 
+Module 	Concert
+Header 	/Engine/Plugins/Developer/Concert/ConcertMain/Source/Concert/Public/IConcertSession.h
+Include 	#include "IConcertSession.h"
+Syntax
+
+class IConcertClientSession : public IConcertSession  
+
+Remarks
+
+Interface for Concert client sessions
+Destructors
+  	Type 	Name 	Description
+Public function Virtual 	  	
+
+~IConcertClientSession ()
+	 
+Functions
+  	Type 	Name 	Description
+Public function 	void 	
+
+Connect ()
+	Start the connection handshake with the server session
+Public function 	void 	
+
+Disconnect ()
+	Disconnect gracefully from the server session
+Public function Const 	EConcertConnectionStatus 	
+
+GetConnectionStatus ()
+	Get the session connection status to the server session
+Public function Const 	const FConcertClientInfo & 	
+
+GetLocalClientInfo ()
+	Get the local user's ClientInfo
+Public function Const 	EConcertSendReceiveState 	
+
+GetSendReceiveState ()
+	Get the send/receive state for this session.
+Public function 	FConcertSequencedCustomEventManager & 	
+
+GetSequencedEventManager ()
+	Manager for helping sequence custom events on client sessions.
+Public function Const 	FGuid 	
+
+GetSessionClientEndpointId ()
+	Get the client endpoint ID
+Public function Const 	FGuid 	
+
+GetSessionServerEndpointId ()
+	Get the server endpoint ID
+Public function Virtual Const 	bool 	
+
+IsSuspended ()
+	Does this session currently have live-updates suspended?
+Public function 	FOnConcertClientSessionConnectionChanged & 	
+
+OnConnectionChanged ()
+	Callback when the session connection state changes
+Public function 	FOnConcertClientSessionClientChanged & 	
+
+OnSessionClientChanged ()
+	Callback when a session client state changes
+Public function 	FOnConcertSessionRenamed & 	
+
+OnSessionRenamed ()
+	Callback when the session name changes.
+Public function 	FOnConcertClientSessionTick & 	
+
+OnTick ()
+	Callback when a connected client session gets ticked
+Public function Virtual 	void 	
+
+Resume ()
+	Resume live-updates for this session (must be paired with a call to Suspend)
+Public function 	void 	
+
+SetSendReceiveState ( EConcertSendReceiveState InSendReceiveState
+)
+	Set the send/receive state for this session.
+Public function Virtual 	void 	
+
+Suspend ()
+	Suspend live-updates for this session
+Public function 	void 	
+
+UpdateLocalClientInfo ( const FConcertClientInfoUpdate& UpdatedFields
+)
+	Update the local user's ClientInfo
+
+IConcertServerSession
+
+Interface for Concert server sessions
+Navigation
+
+API > API/Plugins > API/Plugins/Concert
+Inheritance Hierarchy
+
+    IConcertSession
+    IConcertServerSession
+
+References
+  	 
+Module 	Concert
+Header 	/Engine/Plugins/Developer/Concert/ConcertMain/Source/Concert/Public/IConcertSession.h
+Include 	#include "IConcertSession.h"
+Syntax
+
+class IConcertServerSession : public IConcertSession  
+
+Remarks
+
+Interface for Concert server sessions
+Destructors
+  	Type 	Name 	Description
+Public function Virtual 	  	
+
+~IConcertServerSession ()
+	 
+Functions
+  	Type 	Name 	Description
+Public function Const 	FMessageAddress 	
+
+GetClientAddress ( const FGuid& ClientEndpointId
+)
+	Gets the client's address used by the messaging system. Can be fed into
+Public function 	FOnConcertMessageAcknowledgementReceivedFromLocalEndpoint & 	
+
+OnConcertMessageAcknowledgementReceived ()
+	Callback when a session message is acknowledged
+Public function 	FOnConcertServerSessionClientChanged & 	
+
+OnSessionClientChanged ()
+	Callback when a session client state changes
+Public function 	FOnConcertServerSessionTick & 	
+
+OnTick ()
+	Callback when a server session gets ticked
+Public function 	void 	
+
+SetName ( const FString& NewName
+)
+	Rename the session.
