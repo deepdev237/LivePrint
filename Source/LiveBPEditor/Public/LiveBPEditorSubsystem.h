@@ -6,9 +6,6 @@
 #include "BlueprintGraph/Classes/K2Node.h"
 #include "LiveBPDataTypes.h"
 #include "LiveBPMUEIntegration.h"
-#include "LiveBPLockManager.h"
-#include "LiveBPNotificationSystem.h"
-#include "LiveBPPerformanceMonitor.h"
 #include "LiveBPEditorSubsystem.generated.h"
 
 class SGraphEditor;
@@ -42,9 +39,7 @@ public:
 	void SetDebugModeEnabled(bool bEnabled) { bDebugModeEnabled = bEnabled; }
 	
 	// Access to components (for console commands)
-	FLiveBPMUEIntegration* GetMUEIntegration() const { return MUEIntegration.Get(); }
-	FLiveBPLockManager* GetLockManager() const { return LockManager.Get(); }
-	FLiveBPPerformanceMonitor* GetPerformanceMonitor() const { return PerformanceMonitor.Get(); }
+	ULiveBPMUEIntegration* GetMUEIntegration() const { return MUEIntegration; }
 
 	// Node locking
 	bool RequestNodeLock(UEdGraphNode* Node, float LockDuration = 30.0f);
@@ -61,22 +56,15 @@ private:
 	UPROPERTY()
 	TObjectPtr<ULiveBPMUEIntegration> MUEIntegration;
 
-	UPROPERTY()
-	TObjectPtr<ULiveBPLockManager> LockManager;
-
-	UPROPERTY()
-	TObjectPtr<ULiveBPNotificationSystem> NotificationSystem;
-
-	UPROPERTY()
-	TObjectPtr<FLiveBPPerformanceMonitor> PerformanceMonitor;
-
 	// State
 	bool bCollaborationEnabled;
 	bool bDebugModeEnabled;
 	TMap<UBlueprint*, TWeakPtr<SGraphEditor>> TrackedGraphEditors;
 	TMap<UBlueprint*, FDelegateHandle> BlueprintDelegateHandles;
 	TMap<FGuid, UBlueprint*> BlueprintGuidMap;
-	FTimerHandle LockUpdateTimer;
+	
+	// Node locks (simple implementation without separate LockManager)
+	TMap<FGuid, FLiveBPNodeLock> NodeLocks;
 
 	// Wire preview throttling
 	float LastWirePreviewTime;
@@ -108,7 +96,7 @@ private:
 	void OnWireDragEnd(const TSharedRef<SGraphEditor>& GraphEditor);
 	
 	// Message handling
-	void OnMUEMessageReceived(const FLiveBPMessage& Message, const FConcertSessionContext& Context);
+	void OnMUEMessageReceived(const FLiveBPMessage& Message);
 	void ProcessWirePreviewMessage(const FLiveBPMessage& Message);
 	void ProcessNodeOperationMessage(const FLiveBPMessage& Message);
 	void ProcessLockMessage(const FLiveBPMessage& Message);

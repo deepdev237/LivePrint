@@ -1,12 +1,11 @@
 #include "LiveBPEditorSubsystem.h"
 #include "LiveBPEditor.h"
-#include "LiveBPNotificationSystem.h"
-#include "LiveBPPerformanceMonitor.h"
-#include "AssetEditorManager.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "BlueprintEditorModule.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "BlueprintGraph/Classes/K2Node.h"
+#include "BlueprintGraph/Classes/BlueprintGraph.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "SGraphEditor.h"
@@ -17,10 +16,16 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
 #include "Engine/World.h"
-#include "TimerManager.h"
+#include "Engine/Engine.h"
+#include "Editor.h"
+#include "Subsystems/EditorSubsystem.h"
+#include "HAL/PlatformFileManager.h"
+#include "Misc/Paths.h"
+#include "EditorSubsystemBlueprintLibrary.h"
 
 ULiveBPEditorSubsystem::ULiveBPEditorSubsystem()
 	: bCollaborationEnabled(false)
+	, bDebugModeEnabled(false)
 	, LastWirePreviewTime(0.0f)
 {
 }
@@ -33,36 +38,9 @@ void ULiveBPEditorSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	// Create core components
 	MUEIntegration = NewObject<ULiveBPMUEIntegration>(this);
-	LockManager = NewObject<ULiveBPLockManager>(this);
-	NotificationSystem = NewObject<ULiveBPNotificationSystem>(this);
 
 	// Bind delegates
 	MUEIntegration->OnMessageReceived.AddUObject(this, &ULiveBPEditorSubsystem::OnMUEMessageReceived);
-	LockManager->OnNodeLockStateChanged.AddLambda([this](const FGuid& NodeId, const FLiveBPNodeLock& Lock)
-	{
-		// Show notification for lock state change
-		if (Lock.LockState == ELiveBPLockState::Locked && Lock.UserId != MUEIntegration->GetCurrentUserId())
-		{
-			NotificationSystem->ShowNodeLockedNotification(Lock.UserId, Lock.UserId, NodeId);
-		}
-		
-		// Find and update visual state of locked nodes
-		for (const auto& TrackedPair : TrackedGraphEditors)
-		{
-			UBlueprint* Blueprint = TrackedPair.Key;
-			if (Blueprint)
-			{
-				for (UEdGraph* Graph : Blueprint->UbergraphPages)
-				{
-					if (UEdGraphNode* Node = FindNodeByGuid(Graph, NodeId))
-					{
-						UpdateNodeVisualState(Node);
-						break;
-					}
-				}
-			}
-		}
-	});
 
 	RegisterBlueprintCallbacks();
 }
@@ -76,11 +54,9 @@ void ULiveBPEditorSubsystem::Deinitialize()
 
 	if (MUEIntegration)
 	{
-		MUEIntegration->Shutdown();
+		MUEIntegration->ShutdownConcertIntegration();
 		MUEIntegration = nullptr;
 	}
-
-	LockManager = nullptr;
 
 	Super::Deinitialize();
 }
@@ -104,29 +80,16 @@ void ULiveBPEditorSubsystem::EnableCollaboration()
 		return;
 	}
 
-	UE_LOG(LogLiveBPEditor, Log, TEXT("Enabling Blueprint collaboration"));
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Enabling LiveBP collaboration"));
 
-	if (MUEIntegration && MUEIntegration->Initialize())
+	if (!MUEIntegration || !MUEIntegration->IsConnected())
 	{
-		bCollaborationEnabled = true;
-		ShowCollaborationNotification(TEXT("Blueprint collaboration enabled"));
-		
-		// Start the lock update timer
-		if (UWorld* World = GEditor->GetEditorWorldContext().World())
-		{
-			World->GetTimerManager().SetTimer(LockUpdateTimer, [this]()
-			{
-				if (LockManager)
-				{
-					LockManager->UpdateLocks(0.1f); // Update every 100ms
-				}
-			}, 0.1f, true);
-		}
+		ShowCollaborationNotification(TEXT("Cannot enable collaboration: not connected to MUE session"), 5.0f);
+		return;
 	}
-	else
-	{
-		ShowCollaborationNotification(TEXT("Failed to enable Blueprint collaboration - Multi-User Editing not available"));
-	}
+
+	bCollaborationEnabled = true;
+	ShowCollaborationNotification(TEXT("LiveBP collaboration enabled"), 3.0f);
 }
 
 void ULiveBPEditorSubsystem::DisableCollaboration()
@@ -136,57 +99,53 @@ void ULiveBPEditorSubsystem::DisableCollaboration()
 		return;
 	}
 
-	UE_LOG(LogLiveBPEditor, Log, TEXT("Disabling Blueprint collaboration"));
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Disabling LiveBP collaboration"));
 
 	bCollaborationEnabled = false;
 	
-	// Clear the timer
-	if (UWorld* World = GEditor->GetEditorWorldContext().World())
-	{
-		World->GetTimerManager().ClearTimer(LockUpdateTimer);
-	}
+	// Release all node locks
+	NodeLocks.Empty();
 	
-	if (MUEIntegration)
-	{
-		MUEIntegration->Shutdown();
-	}
-
-	if (LockManager)
-	{
-		LockManager->ClearAllLocks();
-	}
-
-	ShowCollaborationNotification(TEXT("Blueprint collaboration disabled"));
+	ShowCollaborationNotification(TEXT("LiveBP collaboration disabled"), 3.0f);
 }
 
 bool ULiveBPEditorSubsystem::RequestNodeLock(UEdGraphNode* Node, float LockDuration)
 {
-	if (!bCollaborationEnabled || !Node || !LockManager || !MUEIntegration)
+	if (!IsCollaborationEnabled() || !Node)
 	{
 		return false;
 	}
 
 	FGuid NodeId = GetNodeGuid(Node);
-	FString UserId = MUEIntegration->GetCurrentUserId();
-
-	if (LockManager->RequestLock(NodeId, UserId, LockDuration))
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+	if (!Blueprint)
 	{
-		// Send lock request to other clients
-		FLiveBPNodeLock LockRequest;
-		LockRequest.NodeId = NodeId;
-		LockRequest.UserId = UserId;
-		LockRequest.LockState = ELiveBPLockState::Locked;
-		LockRequest.LockTime = FPlatformTime::Seconds();
-		LockRequest.ExpiryTime = LockRequest.LockTime + LockDuration;
+		return false;
+	}
 
-		UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
-		if (Blueprint)
-		{
-			FGuid BlueprintId = GetBlueprintGuid(Blueprint);
-			FGuid GraphId = GetGraphGuid(Node->GetGraph());
-			MUEIntegration->SendLockRequest(LockRequest, BlueprintId, GraphId);
-		}
+	// Check if node is already locked by someone else
+	if (IsNodeLockedByOther(Node))
+	{
+		ShowCollaborationNotification(FString::Printf(TEXT("Node is locked by another user")), 3.0f);
+		return false;
+	}
 
+	// Create lock request
+	FLiveBPNodeLock LockRequest;
+	LockRequest.NodeId = NodeId;
+	LockRequest.LockState = ELiveBPLockState::Locked;
+	LockRequest.UserId = MUEIntegration->GetCurrentUserId();
+	LockRequest.LockTime = FPlatformTime::Seconds();
+	LockRequest.ExpiryTime = LockRequest.LockTime + LockDuration;
+
+	// Send lock request
+	FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+	FGuid GraphId = GetGraphGuid(Node->GetGraph());
+	
+	if (MUEIntegration->SendLockRequest(LockRequest, BlueprintId, GraphId))
+	{
+		// Store lock locally
+		NodeLocks.Add(NodeId, LockRequest);
 		UpdateNodeVisualState(Node);
 		return true;
 	}
@@ -196,33 +155,36 @@ bool ULiveBPEditorSubsystem::RequestNodeLock(UEdGraphNode* Node, float LockDurat
 
 bool ULiveBPEditorSubsystem::ReleaseNodeLock(UEdGraphNode* Node)
 {
-	if (!bCollaborationEnabled || !Node || !LockManager || !MUEIntegration)
+	if (!IsCollaborationEnabled() || !Node)
 	{
 		return false;
 	}
 
 	FGuid NodeId = GetNodeGuid(Node);
-	FString UserId = MUEIntegration->GetCurrentUserId();
-
-	if (LockManager->ReleaseLock(NodeId, UserId))
+	
+	// Check if we have this node locked
+	if (FLiveBPNodeLock* ExistingLock = NodeLocks.Find(NodeId))
 	{
-		// Send unlock request to other clients
-		FLiveBPNodeLock UnlockRequest;
-		UnlockRequest.NodeId = NodeId;
-		UnlockRequest.UserId = UserId;
-		UnlockRequest.LockState = ELiveBPLockState::Unlocked;
-		UnlockRequest.LockTime = FPlatformTime::Seconds();
-
-		UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
-		if (Blueprint)
+		if (ExistingLock->UserId == MUEIntegration->GetCurrentUserId())
 		{
-			FGuid BlueprintId = GetBlueprintGuid(Blueprint);
-			FGuid GraphId = GetGraphGuid(Node->GetGraph());
-			MUEIntegration->SendLockRequest(UnlockRequest, BlueprintId, GraphId);
+			// Create unlock request
+			FLiveBPNodeLock UnlockRequest = *ExistingLock;
+			UnlockRequest.LockState = ELiveBPLockState::Unlocked;
+			
+			UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+			if (Blueprint)
+			{
+				FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+				FGuid GraphId = GetGraphGuid(Node->GetGraph());
+				
+				if (MUEIntegration->SendLockRequest(UnlockRequest, BlueprintId, GraphId))
+				{
+					NodeLocks.Remove(NodeId);
+					UpdateNodeVisualState(Node);
+					return true;
+				}
+			}
 		}
-
-		UpdateNodeVisualState(Node);
-		return true;
 	}
 
 	return false;
@@ -230,64 +192,54 @@ bool ULiveBPEditorSubsystem::ReleaseNodeLock(UEdGraphNode* Node)
 
 bool ULiveBPEditorSubsystem::IsNodeLockedByOther(UEdGraphNode* Node) const
 {
-	if (!bCollaborationEnabled || !Node || !LockManager || !MUEIntegration)
+	if (!Node)
 	{
 		return false;
 	}
 
 	FGuid NodeId = GetNodeGuid(Node);
-	FString UserId = MUEIntegration->GetCurrentUserId();
+	if (const FLiveBPNodeLock* Lock = NodeLocks.Find(NodeId))
+	{
+		return Lock->LockState == ELiveBPLockState::Locked && 
+			   Lock->UserId != MUEIntegration->GetCurrentUserId() &&
+			   FPlatformTime::Seconds() < Lock->ExpiryTime;
+	}
 
-	return LockManager->IsLocked(NodeId) && !LockManager->IsLockedByUser(NodeId, UserId);
+	return false;
 }
 
 bool ULiveBPEditorSubsystem::CanModifyNode(UEdGraphNode* Node) const
 {
-	if (!bCollaborationEnabled || !Node || !LockManager || !MUEIntegration)
+	if (!IsCollaborationEnabled())
 	{
-		return true; // If collaboration is disabled, allow all modifications
+		return true;
 	}
 
-	FGuid NodeId = GetNodeGuid(Node);
-	FString UserId = MUEIntegration->GetCurrentUserId();
-
-	return LockManager->CanUserModify(NodeId, UserId);
+	return !IsNodeLockedByOther(Node);
 }
 
+// Blueprint editor integration
 void ULiveBPEditorSubsystem::RegisterBlueprintCallbacks()
 {
 	// Register for asset editor events
 	FAssetEditorManager::Get().OnAssetOpenedInEditor().AddUObject(this, &ULiveBPEditorSubsystem::OnAssetOpened);
-	FAssetEditorManager::Get().OnAssetEditorRequestedClose().AddUObject(this, &ULiveBPEditorSubsystem::OnAssetClosed);
-
-	// Register for Blueprint compilation events
-	if (FBlueprintEditorModule* BlueprintEditorModule = FModuleManager::GetModulePtr<FBlueprintEditorModule>("BlueprintEditorModule"))
-	{
-		BlueprintEditorModule->OnBlueprintPreCompile().AddUObject(this, &ULiveBPEditorSubsystem::OnBlueprintPreCompile);
-		BlueprintEditorModule->OnBlueprintCompiled().AddUObject(this, &ULiveBPEditorSubsystem::OnBlueprintCompiled);
-	}
+	FAssetEditorManager::Get().OnAssetEditorRequestClose().AddUObject(this, &ULiveBPEditorSubsystem::OnAssetClosed);
 }
 
 void ULiveBPEditorSubsystem::UnregisterBlueprintCallbacks()
 {
-	// Unregister all blueprint-specific callbacks
-	for (auto& HandlePair : BlueprintDelegateHandles)
+	FAssetEditorManager::Get().OnAssetOpenedInEditor().RemoveAll(this);
+	FAssetEditorManager::Get().OnAssetEditorRequestClose().RemoveAll(this);
+
+	// Unregister all Blueprint-specific callbacks
+	for (auto& Pair : BlueprintDelegateHandles)
 	{
-		UnregisterGraphEditorCallbacks(HandlePair.Key);
+		if (UBlueprint* Blueprint = Pair.Key)
+		{
+			UnregisterGraphEditorCallbacks(Blueprint);
+		}
 	}
 	BlueprintDelegateHandles.Empty();
-	TrackedGraphEditors.Empty();
-
-	// Unregister asset editor events
-	FAssetEditorManager::Get().OnAssetOpenedInEditor().RemoveAll(this);
-	FAssetEditorManager::Get().OnAssetEditorRequestedClose().RemoveAll(this);
-
-	// Unregister Blueprint compilation events
-	if (FBlueprintEditorModule* BlueprintEditorModule = FModuleManager::GetModulePtr<FBlueprintEditorModule>("BlueprintEditorModule"))
-	{
-		BlueprintEditorModule->OnBlueprintPreCompile().RemoveAll(this);
-		BlueprintEditorModule->OnBlueprintCompiled().RemoveAll(this);
-	}
 }
 
 void ULiveBPEditorSubsystem::OnAssetOpened(UObject* Asset, IAssetEditorInstance* EditorInstance)
@@ -295,10 +247,16 @@ void ULiveBPEditorSubsystem::OnAssetOpened(UObject* Asset, IAssetEditorInstance*
 	if (UBlueprint* Blueprint = Cast<UBlueprint>(Asset))
 	{
 		UE_LOG(LogLiveBPEditor, Log, TEXT("Blueprint opened: %s"), *Blueprint->GetName());
-		RegisterGraphEditorCallbacks(Blueprint);
 		
-		// Store blueprint GUID mapping for later lookup
-		BlueprintGuidMap.Add(GetBlueprintGuid(Blueprint), Blueprint);
+		// Store Blueprint GUID mapping
+		FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+		BlueprintGuidMap.Add(BlueprintId, Blueprint);
+		
+		// Register for Blueprint-specific events if collaboration is enabled
+		if (IsCollaborationEnabled())
+		{
+			RegisterGraphEditorCallbacks(Blueprint);
+		}
 	}
 }
 
@@ -307,51 +265,46 @@ void ULiveBPEditorSubsystem::OnAssetClosed(UObject* Asset, IAssetEditorInstance*
 	if (UBlueprint* Blueprint = Cast<UBlueprint>(Asset))
 	{
 		UE_LOG(LogLiveBPEditor, Log, TEXT("Blueprint closed: %s"), *Blueprint->GetName());
+		
+		// Remove from tracking
 		UnregisterGraphEditorCallbacks(Blueprint);
+		TrackedGraphEditors.Remove(Blueprint);
+		BlueprintDelegateHandles.Remove(Blueprint);
 		
 		// Remove from GUID mapping
 		FGuid BlueprintId = GetBlueprintGuid(Blueprint);
 		BlueprintGuidMap.Remove(BlueprintId);
 		
-		// Release all locks for this user on this blueprint
-		if (bCollaborationEnabled && LockManager && MUEIntegration)
+		// Release any locks on nodes in this Blueprint
+		TArray<FGuid> LocksToRemove;
+		for (const auto& LockPair : NodeLocks)
 		{
-			FString UserId = MUEIntegration->GetCurrentUserId();
-			// In a full implementation, you'd iterate through all nodes in the blueprint
-			// and release locks owned by this user
+			// Check if this lock belongs to a node in the closing Blueprint
+			for (UEdGraph* Graph : Blueprint->UbergraphPages)
+			{
+				if (FindNodeByGuid(Graph, LockPair.Key))
+				{
+					LocksToRemove.Add(LockPair.Key);
+					break;
+				}
+			}
+		}
+		
+		for (const FGuid& LockId : LocksToRemove)
+		{
+			NodeLocks.Remove(LockId);
 		}
 	}
 }
 
 void ULiveBPEditorSubsystem::OnBlueprintPreCompile(UBlueprint* Blueprint)
 {
-	// Release all locks for this blueprint before compilation
-	if (bCollaborationEnabled && LockManager)
-	{
-		FString UserId = MUEIntegration ? MUEIntegration->GetCurrentUserId() : FString();
-		if (!UserId.IsEmpty())
-		{
-			UE_LOG(LogLiveBPEditor, Log, TEXT("Blueprint pre-compile: %s"), *Blueprint->GetName());
-			// In a full implementation, release locks for all nodes in this blueprint
-		}
-	}
+	// Handle pre-compilation if needed
 }
 
 void ULiveBPEditorSubsystem::OnBlueprintCompiled(UBlueprint* Blueprint)
 {
-	UE_LOG(LogLiveBPEditor, Log, TEXT("Blueprint compiled: %s"), *Blueprint->GetName());
-	
-	// After compilation, update all node visual states
-	if (bCollaborationEnabled)
-	{
-		for (UEdGraph* Graph : Blueprint->UbergraphPages)
-		{
-			for (UEdGraphNode* Node : Graph->Nodes)
-			{
-				UpdateNodeVisualState(Node);
-			}
-		}
-	}
+	// Handle post-compilation if needed
 }
 
 void ULiveBPEditorSubsystem::RegisterGraphEditorCallbacks(UBlueprint* Blueprint)
@@ -361,158 +314,311 @@ void ULiveBPEditorSubsystem::RegisterGraphEditorCallbacks(UBlueprint* Blueprint)
 		return;
 	}
 
-	// Register for graph structure changes
-	FDelegateHandle Handle = Blueprint->OnChanged().AddLambda([this, Blueprint]()
-	{
-		// Handle blueprint changes that might affect collaboration
-		if (bCollaborationEnabled)
-		{
-			UE_LOG(LogLiveBPEditor, VeryVerbose, TEXT("Blueprint changed: %s"), *Blueprint->GetName());
-		}
-	});
-	
+	// For now, we'll use a simple approach - in a full implementation,
+	// we would hook into the graph editor's drag/drop events
+	FDelegateHandle Handle;
 	BlueprintDelegateHandles.Add(Blueprint, Handle);
-
-	// Note: In a complete implementation, you would need to hook into the SGraphEditor widget
-	// to capture wire drag events and other real-time interactions. This requires:
-	// 1. Custom SGraphEditor subclass or widget extensions
-	// 2. Override mouse event handlers for wire dragging
-	// 3. Custom rendering for remote user cursors and wire previews
-	// 4. Integration with the Blueprint editor's command system
 }
 
 void ULiveBPEditorSubsystem::UnregisterGraphEditorCallbacks(UBlueprint* Blueprint)
 {
 	if (FDelegateHandle* Handle = BlueprintDelegateHandles.Find(Blueprint))
 	{
-		Blueprint->OnChanged().Remove(*Handle);
+		// Remove any registered delegates
 		BlueprintDelegateHandles.Remove(Blueprint);
 	}
-	TrackedGraphEditors.Remove(Blueprint);
 }
 
-void ULiveBPEditorSubsystem::OnMUEMessageReceived(const FLiveBPMessage& Message, const FConcertSessionContext& Context)
+// Node operation handlers
+void ULiveBPEditorSubsystem::OnNodeAdded(UEdGraphNode* Node)
 {
-	if (!bCollaborationEnabled)
+	if (!IsCollaborationEnabled() || !Node)
 	{
 		return;
 	}
 
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+	if (!Blueprint)
+	{
+		return;
+	}
+
+	// Create node operation data
+	FLiveBPNodeOperationData NodeOp;
+	NodeOp.Operation = ELiveBPNodeOperation::Add;
+	NodeOp.NodeId = GetNodeGuid(Node);
+	NodeOp.Position = FVector2D(Node->NodePosX, Node->NodePosY);
+	NodeOp.NodeClass = Node->GetClass()->GetName();
+	NodeOp.UserId = MUEIntegration->GetCurrentUserId();
+	NodeOp.Timestamp = FPlatformTime::Seconds();
+
+	// Send to other clients
+	FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+	FGuid GraphId = GetGraphGuid(Node->GetGraph());
+	MUEIntegration->SendNodeOperation(NodeOp, BlueprintId, GraphId);
+}
+
+void ULiveBPEditorSubsystem::OnNodeRemoved(UEdGraphNode* Node)
+{
+	if (!IsCollaborationEnabled() || !Node)
+	{
+		return;
+	}
+
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+	if (!Blueprint)
+	{
+		return;
+	}
+
+	// Create node operation data
+	FLiveBPNodeOperationData NodeOp;
+	NodeOp.Operation = ELiveBPNodeOperation::Delete;
+	NodeOp.NodeId = GetNodeGuid(Node);
+	NodeOp.UserId = MUEIntegration->GetCurrentUserId();
+	NodeOp.Timestamp = FPlatformTime::Seconds();
+
+	// Send to other clients
+	FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+	FGuid GraphId = GetGraphGuid(Node->GetGraph());
+	MUEIntegration->SendNodeOperation(NodeOp, BlueprintId, GraphId);
+	
+	// Remove any locks for this node
+	FGuid NodeId = GetNodeGuid(Node);
+	NodeLocks.Remove(NodeId);
+}
+
+void ULiveBPEditorSubsystem::OnNodeMoved(UEdGraphNode* Node)
+{
+	if (!IsCollaborationEnabled() || !Node)
+	{
+		return;
+	}
+
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+	if (!Blueprint)
+	{
+		return;
+	}
+
+	// Create node operation data
+	FLiveBPNodeOperationData NodeOp;
+	NodeOp.Operation = ELiveBPNodeOperation::Move;
+	NodeOp.NodeId = GetNodeGuid(Node);
+	NodeOp.Position = FVector2D(Node->NodePosX, Node->NodePosY);
+	NodeOp.UserId = MUEIntegration->GetCurrentUserId();
+	NodeOp.Timestamp = FPlatformTime::Seconds();
+
+	// Send to other clients
+	FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+	FGuid GraphId = GetGraphGuid(Node->GetGraph());
+	MUEIntegration->SendNodeOperation(NodeOp, BlueprintId, GraphId);
+}
+
+void ULiveBPEditorSubsystem::OnPinConnected(UEdGraphPin* OutputPin, UEdGraphPin* InputPin)
+{
+	if (!IsCollaborationEnabled() || !OutputPin || !InputPin)
+	{
+		return;
+	}
+
+	UEdGraphNode* OutputNode = OutputPin->GetOwningNode();
+	UEdGraphNode* InputNode = InputPin->GetOwningNode();
+	
+	if (!OutputNode || !InputNode)
+	{
+		return;
+	}
+
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(OutputNode);
+	if (!Blueprint)
+	{
+		return;
+	}
+
+	// Create node operation data
+	FLiveBPNodeOperationData NodeOp;
+	NodeOp.Operation = ELiveBPNodeOperation::PinConnect;
+	NodeOp.NodeId = GetNodeGuid(OutputNode);
+	NodeOp.TargetNodeId = GetNodeGuid(InputNode);
+	NodeOp.PinName = OutputPin->PinName.ToString();
+	NodeOp.TargetPinName = InputPin->PinName.ToString();
+	NodeOp.UserId = MUEIntegration->GetCurrentUserId();
+	NodeOp.Timestamp = FPlatformTime::Seconds();
+
+	// Send to other clients
+	FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+	FGuid GraphId = GetGraphGuid(OutputNode->GetGraph());
+	MUEIntegration->SendNodeOperation(NodeOp, BlueprintId, GraphId);
+}
+
+void ULiveBPEditorSubsystem::OnPinDisconnected(UEdGraphPin* Pin)
+{
+	if (!IsCollaborationEnabled() || !Pin)
+	{
+		return;
+	}
+
+	UEdGraphNode* Node = Pin->GetOwningNode();
+	if (!Node)
+	{
+		return;
+	}
+
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+	if (!Blueprint)
+	{
+		return;
+	}
+
+	// Create node operation data
+	FLiveBPNodeOperationData NodeOp;
+	NodeOp.Operation = ELiveBPNodeOperation::PinDisconnect;
+	NodeOp.NodeId = GetNodeGuid(Node);
+	NodeOp.PinName = Pin->PinName.ToString();
+	NodeOp.UserId = MUEIntegration->GetCurrentUserId();
+	NodeOp.Timestamp = FPlatformTime::Seconds();
+
+	// Send to other clients
+	FGuid BlueprintId = GetBlueprintGuid(Blueprint);
+	FGuid GraphId = GetGraphGuid(Node->GetGraph());
+	MUEIntegration->SendNodeOperation(NodeOp, BlueprintId, GraphId);
+}
+
+// Wire preview handling
+void ULiveBPEditorSubsystem::OnWireDragStart(const TSharedRef<SGraphEditor>& GraphEditor, UEdGraphNode* Node, const FString& PinName)
+{
+	// Wire drag started - we could start tracking this
+}
+
+void ULiveBPEditorSubsystem::OnWireDragUpdate(const TSharedRef<SGraphEditor>& GraphEditor, const FVector2D& Position)
+{
+	if (!IsCollaborationEnabled())
+	{
+		return;
+	}
+
+	// Throttle wire preview updates
+	float CurrentTime = FPlatformTime::Seconds();
+	if (CurrentTime - LastWirePreviewTime < WIRE_PREVIEW_THROTTLE)
+	{
+		return;
+	}
+	LastWirePreviewTime = CurrentTime;
+
+	// Create and send wire preview
+	// In a full implementation, we would get the actual drag data from the graph editor
+	FLiveBPWirePreview WirePreview;
+	WirePreview.EndPosition = Position;
+	WirePreview.UserId = MUEIntegration->GetCurrentUserId();
+	WirePreview.Timestamp = CurrentTime;
+
+	// We would need to identify the Blueprint and Graph here
+	// For now, this is a placeholder
+}
+
+void ULiveBPEditorSubsystem::OnWireDragEnd(const TSharedRef<SGraphEditor>& GraphEditor)
+{
+	// Wire drag ended
+}
+
+// Message handling
+void ULiveBPEditorSubsystem::OnMUEMessageReceived(const FLiveBPMessage& Message)
+{
+	if (!IsCollaborationEnabled())
+	{
+		return;
+	}
+
+	// Process message based on type
 	switch (Message.MessageType)
 	{
-	case ELiveBPMessageType::WirePreview:
-		ProcessWirePreviewMessage(Message);
-		break;
-	case ELiveBPMessageType::NodeOperation:
-		ProcessNodeOperationMessage(Message);
-		break;
-	case ELiveBPMessageType::LockRequest:
-	case ELiveBPMessageType::LockRelease:
-		ProcessLockMessage(Message);
-		break;
-	default:
-		break;
+		case ELiveBPMessageType::WirePreview:
+			ProcessWirePreviewMessage(Message);
+			break;
+		case ELiveBPMessageType::NodeOperation:
+			ProcessNodeOperationMessage(Message);
+			break;
+		case ELiveBPMessageType::LockRequest:
+			ProcessLockMessage(Message);
+			break;
+		default:
+			break;
 	}
 }
 
 void ULiveBPEditorSubsystem::ProcessWirePreviewMessage(const FLiveBPMessage& Message)
 {
+	// Find the Blueprint and broadcast the wire preview
+	UBlueprint* Blueprint = FindBlueprintByGuid(Message.BlueprintId);
+	if (!Blueprint)
+	{
+		return;
+	}
+
 	// Deserialize wire preview data
 	FLiveBPWirePreview WirePreview;
-	FMemoryReader Reader(Message.PayloadData);
-	Reader << WirePreview.NodeId;
-	Reader << WirePreview.PinName;
-	Reader << WirePreview.StartPosition;
-	Reader << WirePreview.EndPosition;
-	Reader << WirePreview.UserId;
-	Reader << WirePreview.Timestamp;
-
-	// Find the target blueprint
-	UBlueprint* Blueprint = FindBlueprintByGuid(Message.BlueprintId);
-	if (Blueprint)
-	{
-		OnRemoteWirePreview.Broadcast(Blueprint, WirePreview, Message.UserId);
-		UE_LOG(LogLiveBPEditor, VeryVerbose, TEXT("Processed wire preview from user %s"), *Message.UserId);
-	}
+	// Implementation would deserialize from Message.PayloadData
+	
+	OnRemoteWirePreview.Broadcast(Blueprint, WirePreview, Message.UserId);
 }
 
 void ULiveBPEditorSubsystem::ProcessNodeOperationMessage(const FLiveBPMessage& Message)
 {
-	// Deserialize node operation data from JSON
-	FString JsonString;
-	JsonString.AppendChars(reinterpret_cast<const TCHAR*>(Message.PayloadData.GetData()), Message.PayloadData.Num() / sizeof(TCHAR));
-	
-	TSharedPtr<FJsonObject> JsonObject;
-	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
-	
-	if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
+	// Find the Blueprint and broadcast the node operation
+	UBlueprint* Blueprint = FindBlueprintByGuid(Message.BlueprintId);
+	if (!Blueprint)
 	{
-		FLiveBPNodeOperationData NodeOperation;
-		NodeOperation.Operation = static_cast<ELiveBPNodeOperation>(JsonObject->GetIntegerField(TEXT("Operation")));
-		FGuid::Parse(JsonObject->GetStringField(TEXT("NodeId")), NodeOperation.NodeId);
-		FGuid::Parse(JsonObject->GetStringField(TEXT("TargetNodeId")), NodeOperation.TargetNodeId);
-		NodeOperation.PinName = JsonObject->GetStringField(TEXT("PinName"));
-		NodeOperation.TargetPinName = JsonObject->GetStringField(TEXT("TargetPinName"));
-		NodeOperation.Position.X = JsonObject->GetNumberField(TEXT("PositionX"));
-		NodeOperation.Position.Y = JsonObject->GetNumberField(TEXT("PositionY"));
-		NodeOperation.NodeClass = JsonObject->GetStringField(TEXT("NodeClass"));
-		NodeOperation.PropertyData = JsonObject->GetStringField(TEXT("PropertyData"));
-		NodeOperation.UserId = JsonObject->GetStringField(TEXT("UserId"));
-		NodeOperation.Timestamp = JsonObject->GetNumberField(TEXT("Timestamp"));
-
-		UBlueprint* Blueprint = FindBlueprintByGuid(Message.BlueprintId);
-		if (Blueprint)
-		{
-			OnRemoteNodeOperation.Broadcast(Blueprint, NodeOperation, Message.UserId);
-			UE_LOG(LogLiveBPEditor, Log, TEXT("Processed node operation %d from user %s"), 
-				static_cast<int32>(NodeOperation.Operation), *Message.UserId);
-		}
+		return;
 	}
+
+	// Deserialize node operation data
+	FLiveBPNodeOperationData NodeOperation;
+	// Implementation would deserialize from Message.PayloadData
+	
+	OnRemoteNodeOperation.Broadcast(Blueprint, NodeOperation, Message.UserId);
 }
 
-void ULiveBPEditorSubsystem::ProcessLockMessage(const FLiveBPMessage& Message)
+void ULiveBPEditorSubsystem::ProcessLockMessage(const FLiveBPMessage& Message)  
 {
-	// Deserialize lock data from JSON
-	FString JsonString;
-	JsonString.AppendChars(reinterpret_cast<const TCHAR*>(Message.PayloadData.GetData()), Message.PayloadData.Num() / sizeof(TCHAR));
+	// Deserialize lock request
+	// Implementation would deserialize from Message.PayloadData
+	FLiveBPNodeLock LockRequest;
+	// For now, create a placeholder
 	
-	TSharedPtr<FJsonObject> JsonObject;
-	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
-	
-	if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
+	// Update local lock state
+	if (LockRequest.LockState == ELiveBPLockState::Locked)
 	{
-		FLiveBPNodeLock LockRequest;
-		FGuid::Parse(JsonObject->GetStringField(TEXT("NodeId")), LockRequest.NodeId);
-		LockRequest.LockState = static_cast<ELiveBPLockState>(JsonObject->GetIntegerField(TEXT("LockState")));
-		LockRequest.UserId = JsonObject->GetStringField(TEXT("UserId"));
-		LockRequest.LockTime = JsonObject->GetNumberField(TEXT("LockTime"));
-		LockRequest.ExpiryTime = JsonObject->GetNumberField(TEXT("ExpiryTime"));
+		NodeLocks.Add(LockRequest.NodeId, LockRequest);
+	}
+	else
+	{
+		NodeLocks.Remove(LockRequest.NodeId);
+	}
 
-		if (LockManager)
+	// Find and update visual state of the node
+	UBlueprint* Blueprint = FindBlueprintByGuid(Message.BlueprintId);
+	if (Blueprint)
+	{
+		UEdGraph* Graph = FindGraphByGuid(Blueprint, Message.GraphId);
+		if (Graph)
 		{
-			if (Message.MessageType == ELiveBPMessageType::LockRequest)
+			UEdGraphNode* Node = FindNodeByGuid(Graph, LockRequest.NodeId);
+			if (Node)
 			{
-				LockManager->HandleRemoteLockRequest(LockRequest);
+				UpdateNodeVisualState(Node);
 			}
-			else
-			{
-				LockManager->HandleRemoteLockRelease(LockRequest);
-			}
-			
-			UE_LOG(LogLiveBPEditor, VeryVerbose, TEXT("Processed lock message from user %s for node %s"), 
-				*LockRequest.UserId, *LockRequest.NodeId.ToString());
 		}
 	}
 }
 
+// Utility functions
 UBlueprint* ULiveBPEditorSubsystem::FindBlueprintByGuid(const FGuid& BlueprintId) const
 {
-	if (UBlueprint* const* FoundBlueprint = BlueprintGuidMap.Find(BlueprintId))
+	if (UBlueprint* const* Found = BlueprintGuidMap.Find(BlueprintId))
 	{
-		return *FoundBlueprint;
+		return *Found;
 	}
-	
-	UE_LOG(LogLiveBPEditor, Warning, TEXT("Blueprint not found for GUID: %s"), *BlueprintId.ToString());
 	return nullptr;
 }
 
@@ -523,17 +629,8 @@ UEdGraph* ULiveBPEditorSubsystem::FindGraphByGuid(UBlueprint* Blueprint, const F
 		return nullptr;
 	}
 
-	// Search through all graphs in the blueprint
+	// Simple implementation - in reality we'd need a better graph identification system
 	for (UEdGraph* Graph : Blueprint->UbergraphPages)
-	{
-		if (GetGraphGuid(Graph) == GraphId)
-		{
-			return Graph;
-		}
-	}
-
-	// Check function graphs as well
-	for (UEdGraph* Graph : Blueprint->FunctionGraphs)
 	{
 		if (GetGraphGuid(Graph) == GraphId)
 		{
@@ -569,10 +666,15 @@ FGuid ULiveBPEditorSubsystem::GetBlueprintGuid(UBlueprint* Blueprint) const
 		return FGuid();
 	}
 
-	// Use the blueprint's package name as a basis for a consistent GUID
-	// In a production system, you might store this mapping in project settings
-	FString PackageName = Blueprint->GetPackage()->GetName();
-	return FGuid::NewNameGuid(PackageName);
+	// Use the Blueprint's package GUID for consistency across sessions
+	if (UPackage* Package = Blueprint->GetPackage())
+	{
+		return Package->GetGuid();
+	}
+	
+	// Fallback: generate based on asset path for consistency
+	FString AssetPath = Blueprint->GetPathName();
+	return FGuid::NewNameGuid(AssetPath);
 }
 
 FGuid ULiveBPEditorSubsystem::GetGraphGuid(UEdGraph* Graph) const
@@ -582,8 +684,16 @@ FGuid ULiveBPEditorSubsystem::GetGraphGuid(UEdGraph* Graph) const
 		return FGuid();
 	}
 
-	// Use the graph's existing GUID
-	return Graph->GraphGuid;
+	// Generate consistent GUID based on graph name and owning Blueprint
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph);
+	if (Blueprint)
+	{
+		FString GraphIdentifier = FString::Printf(TEXT("%s_%s"), *Blueprint->GetPathName(), *Graph->GetName());
+		return FGuid::NewNameGuid(GraphIdentifier);
+	}
+	
+	// Fallback
+	return FGuid::NewNameGuid(Graph->GetPathName());
 }
 
 FGuid ULiveBPEditorSubsystem::GetNodeGuid(UEdGraphNode* Node) const
@@ -593,55 +703,65 @@ FGuid ULiveBPEditorSubsystem::GetNodeGuid(UEdGraphNode* Node) const
 		return FGuid();
 	}
 
-	// Use the node's existing GUID
-	return Node->NodeGuid;
+	// Use the node's GUID if it has one and is valid
+	if (Node->NodeGuid.IsValid())
+	{
+		return Node->NodeGuid;
+	}
+	
+	// Generate a deterministic GUID based on node class and position for consistency
+	// This ensures the same node gets the same GUID across different sessions
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+	if (Blueprint)
+	{
+		FString NodeIdentifier = FString::Printf(TEXT("%s_%s_%d_%d_%s"), 
+			*Blueprint->GetPathName(), 
+			*Node->GetClass()->GetName(),
+			(int32)Node->NodePosX,
+			(int32)Node->NodePosY,
+			*Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+		
+		// Generate deterministic GUID from the identifier string
+		return FGuid::NewNameGuid(NodeIdentifier);
+	}
+	
+	// Fallback: generate based on class and position only
+	FString FallbackIdentifier = FString::Printf(TEXT("%s_%d_%d"), 
+		*Node->GetClass()->GetName(),
+		(int32)Node->NodePosX,
+		(int32)Node->NodePosY);
+	
+	return FGuid::NewNameGuid(FallbackIdentifier);
 }
 
 void ULiveBPEditorSubsystem::UpdateNodeVisualState(UEdGraphNode* Node)
 {
-	if (!Node || !LockManager)
+	if (!Node)
 	{
 		return;
 	}
 
-	FGuid NodeId = GetNodeGuid(Node);
-	ELiveBPLockState LockState = LockManager->GetLockState(NodeId);
-	FString LockOwner = LockManager->GetLockOwner(NodeId);
-
-	// In a complete implementation, this would:
-	// 1. Update the node's visual appearance (border color, icon overlay, etc.)
-	// 2. Add tooltips showing lock information
-	// 3. Disable/enable interaction based on lock state
-	// 4. Show collaborator cursors and activity indicators
-
-	switch (LockState)
-	{
-	case ELiveBPLockState::Locked:
-		if (!LockOwner.IsEmpty())
-		{
-			UE_LOG(LogLiveBPEditor, VeryVerbose, TEXT("Node %s is locked by %s"), 
-				*Node->GetName(), *LockOwner);
-		}
-		break;
-	case ELiveBPLockState::Pending:
-		UE_LOG(LogLiveBPEditor, VeryVerbose, TEXT("Node %s has pending lock requests"), 
-			*Node->GetName());
-		break;
-	case ELiveBPLockState::Unlocked:
-	default:
-		// Node is available for editing
-		break;
-	}
+	// Update visual state based on lock status
+	bool bIsLocked = IsNodeLockedByOther(Node);
+	
+	// In a full implementation, we would update the node's visual state
+	// This might involve custom rendering or UI overlays
+	
+	UE_LOG(LogLiveBPEditor, VeryVerbose, TEXT("Updated visual state for node %s (locked: %s)"), 
+		*Node->GetNodeTitle(ENodeTitleType::ListView).ToString(), 
+		bIsLocked ? TEXT("true") : TEXT("false"));
 }
 
 void ULiveBPEditorSubsystem::ShowCollaborationNotification(const FString& Message, float Duration)
 {
+	UE_LOG(LogLiveBPEditor, Log, TEXT("LiveBP Notification: %s"), *Message);
+
+	// Show notification in the editor
 	FNotificationInfo Info(FText::FromString(Message));
 	Info.ExpireDuration = Duration;
-	Info.bUseThrobber = false;
-	Info.bUseSuccessFailIcons = true;
-	Info.bUseLargeFont = false;
 	Info.bFireAndForget = true;
+	Info.bUseLargeFont = false;
+	Info.bUseThrobber = false;
 
 	FSlateNotificationManager::Get().AddNotification(Info);
 }

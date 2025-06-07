@@ -26,15 +26,5 @@ private:
 	static void ToggleDebugMode(const TArray<FString>& Args);
 	static void ShowHelp(const TArray<FString>& Args);
 
-	// Console command objects
-	static TAutoConsoleCommand<FString> ShowStatsCmd;
-	static TAutoConsoleCommand<FString> TestConnectionCmd;
-	static TAutoConsoleCommand<FString> ClearLocksCmd;
-	static TAutoConsoleCommand<FString> SimulateLatencyCmd;
-	static TAutoConsoleCommand<FString> DumpMessagesCmd;
-	static TAutoConsoleCommand<FString> RunTestsCmd;
-	static TAutoConsoleCommand<FString> ToggleDebugModeCmd;
-	static TAutoConsoleCommand<FString> ShowHelpCmd;
-
 	static bool bCommandsRegistered;
 };

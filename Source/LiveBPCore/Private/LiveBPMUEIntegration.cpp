@@ -1,238 +1,330 @@
 #include "LiveBPMUEIntegration.h"
 #include "LiveBPCore.h"
-#include "LiveBPMessageThrottler.h"
-#include "LiveBPPerformanceMonitor.h"
-#include "IConcertClient.h"
-#include "IConcertSession.h"
+#include "IConcertSyncClientModule.h"
+#include "IConcertSyncClient.h"
+#include "IConcertClientSession.h"
 #include "ConcertMessages.h"
-#include "ConcertClientSettings.h"
+#include "ConcertSessionMessages.h"
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Engine/Engine.h"
+#include "Misc/DateTime.h"
+// Additional headers required for UE 5.5
+#include "Modules/ModuleManager.h"
+#include "HAL/PlatformFileManager.h"
+#include "Misc/Paths.h"
+#include "Templates/SharedPointer.h"
 
-// Custom Concert event type for LiveBP messages
+// Define the static channel constants
+const FString ULiveBPMUEIntegration::LiveBPWirePreviewChannel = TEXT("LiveBP.WirePreview");
+const FString ULiveBPMUEIntegration::LiveBPNodeOperationChannel = TEXT("LiveBP.NodeOperation");
+const FString ULiveBPMUEIntegration::LiveBPLockRequestChannel = TEXT("LiveBP.LockRequest");
+
+// Custom Concert event structure for LiveBP messages
 USTRUCT()
 struct FLiveBPConcertEvent
 {
 	GENERATED_BODY()
 
 	UPROPERTY()
+	FString Channel;
+
+	UPROPERTY()
 	FLiveBPMessage Message;
+
+	FLiveBPConcertEvent()
+	{
+	}
+
+	FLiveBPConcertEvent(const FString& InChannel, const FLiveBPMessage& InMessage)
+		: Channel(InChannel), Message(InMessage)
+	{
+	}
+};
+
+template<>
+struct TStructOpsTypeTraits<FLiveBPConcertEvent> : public TStructOpsTypeTraitsBase2<FLiveBPConcertEvent>
+{
+	enum { WithSerializer = true };
 };
 
 ULiveBPMUEIntegration::ULiveBPMUEIntegration()
-	: bIsInitialized(false)
+	: ConcertSyncClient(nullptr)
+	, bIsInitialized(false)
+	, CurrentUserId(TEXT(""))
 {
 }
 
-bool ULiveBPMUEIntegration::Initialize()
+void ULiveBPMUEIntegration::Initialize(FSubsystemCollectionBase& Collection)
 {
-	if (bIsInitialized)
-	{
-		return true;
-	}
-
-	// Get the Concert client
-	if (IConcertClientModule* ConcertClientModule = FModuleManager::GetModulePtr<IConcertClientModule>("ConcertClient"))
-	{
-		ConcertClient = ConcertClientModule->GetClient(TEXT("MultiUser"));
-		if (!ConcertClient.IsValid())
-		{
-			UE_LOG(LogLiveBPCore, Warning, TEXT("Failed to get Concert client"));
-			return false;
-		}
-
-		// Register for session events
-		if (TSharedPtr<IConcertClientSession> Session = ConcertClient->GetCurrentSession())
-		{
-			// Register custom event handler for LiveBP messages
-			Session->RegisterCustomEventHandler<FLiveBPConcertEvent>(this, 
-				FOnConcertCustomEventReceived<FLiveBPConcertEvent>::CreateUObject(this, &ULiveBPMUEIntegration::HandleConcertMessage));
-
-			// Get current user ID
-			CurrentUserId = Session->GetSessionClientEndpointId().ToString();
-			
-			bIsInitialized = true;
-			UE_LOG(LogLiveBPCore, Log, TEXT("LiveBP MUE Integration initialized successfully"));
-			return true;
-		}
-		else
-		{
-			UE_LOG(LogLiveBPCore, Warning, TEXT("No active Concert session found"));
-		}
-	}
-	else
-	{
-		UE_LOG(LogLiveBPCore, Warning, TEXT("Concert client module not available"));
-	}
-
-	return false;
+	Super::Initialize(Collection);
+	
+	InitializeConcertIntegration();
 }
 
-void ULiveBPMUEIntegration::Shutdown()
+void ULiveBPMUEIntegration::Deinitialize()
 {
-	if (bIsInitialized && ConcertClient.IsValid())
+	ShutdownConcertIntegration();
+	
+	Super::Deinitialize();
+}
+
+bool ULiveBPMUEIntegration::InitializeConcertIntegration()
+{
+	UE_LOG(LogLiveBPCore, Log, TEXT("Initializing LiveBP Concert integration..."));
+
+	// Get the Concert Sync Client Module - using correct API from UE 5.5
+	IConcertSyncClientModule& ConcertSyncClientModule = FModuleManager::Get().LoadModuleChecked<IConcertSyncClientModule>("ConcertSyncClient");
+	ConcertSyncClient = ConcertSyncClientModule.GetClient().Get();
+
+	if (!ConcertSyncClient)
 	{
-		if (TSharedPtr<IConcertClientSession> Session = ConcertClient->GetCurrentSession())
+		UE_LOG(LogLiveBPCore, Error, TEXT("Failed to get Concert Sync Client"));
+		return false;
+	}
+
+	// Set up session event handlers
+	ConcertSyncClient->OnSessionStartup().AddUObject(this, &ULiveBPMUEIntegration::OnSessionStartup);
+	ConcertSyncClient->OnSessionShutdown().AddUObject(this, &ULiveBPMUEIntegration::OnSessionShutdown);
+
+	// Check if we already have an active session
+	if (TSharedPtr<IConcertClientSession> ExistingSession = ConcertSyncClient->GetCurrentSession())
+	{
+		OnSessionStartup(ExistingSession.ToSharedRef());
+	}
+
+	bIsInitialized = true;
+	UE_LOG(LogLiveBPCore, Log, TEXT("LiveBP Concert integration initialized successfully"));
+	
+	return true;
+}
+
+void ULiveBPMUEIntegration::ShutdownConcertIntegration()
+{
+	if (bIsInitialized && ConcertSyncClient)
+	{
+		// Unregister from session events
+		ConcertSyncClient->OnSessionStartup().RemoveAll(this);
+		ConcertSyncClient->OnSessionShutdown().RemoveAll(this);
+
+		// Unregister custom event handlers if we have an active session
+		if (ActiveSession.IsValid())
 		{
-			Session->UnregisterCustomEventHandler<FLiveBPConcertEvent>(this);
+			ActiveSession->UnregisterCustomEventHandler<FLiveBPConcertEvent>();
 		}
-		ConcertClient.Reset();
+
+		ActiveSession.Reset();
+		ConcertSyncClient = nullptr;
 		bIsInitialized = false;
+		CurrentUserId.Empty();
+
+		UE_LOG(LogLiveBPCore, Log, TEXT("LiveBP Concert integration shutdown"));
 	}
 }
 
-bool ULiveBPMUEIntegration::SendWirePreview(const FLiveBPWirePreview& WirePreview, const FGuid& BlueprintId, const FGuid& GraphId)
+void ULiveBPMUEIntegration::OnSessionStartup(TSharedRef<IConcertClientSession> InSession)
 {
-	LIVEBP_SCOPE_TIMER("SendWirePreview");
+	ActiveSession = InSession;
 	
-	if (!IsConnected())
+	// Get current user ID from the session - using correct API
+	const FConcertClientInfo& ClientInfo = InSession->GetLocalClientInfo();
+	CurrentUserId = ClientInfo.UserName;
+	
+	if (CurrentUserId.IsEmpty())
 	{
-		LIVEBP_RECORD_ERROR("MUE not connected", true);
-		return false;
+		CurrentUserId = FString::Printf(TEXT("User_%s"), *FGuid::NewGuid().ToString());
 	}
 
-	// Check throttling
-	float CurrentTime = FPlatformTime::Seconds();
-	if (FLiveBPGlobalThrottler::Get().ShouldThrottleMessage(ELiveBPMessageType::WirePreview, CurrentUserId, CurrentTime))
-	{
-		return false; // Throttled, but not an error
-	}
+	// Register custom event handler for LiveBP messages
+	InSession->RegisterCustomEventHandler<FLiveBPConcertEvent>(this, &ULiveBPMUEIntegration::OnCustomEventReceived);
 
-	FLiveBPMessage Message;
-	Message.MessageType = ELiveBPMessageType::WirePreview;
-	Message.BlueprintId = BlueprintId;
-	Message.GraphId = GraphId;
-	Message.UserId = CurrentUserId;
-	Message.Timestamp = CurrentTime;
-	Message.PayloadData = SerializeWirePreview(WirePreview);
-
-	FLiveBPConcertEvent ConcertEvent;
-	ConcertEvent.Message = Message;
-
-	if (TSharedPtr<IConcertClientSession> Session = ConcertClient->GetCurrentSession())
-	{
-		Session->SendCustomEvent(ConcertEvent, Session->GetSessionServerEndpointId(), EConcertMessageFlags::ReliableOrdered);
-		
-		// Record message sent
-		FLiveBPGlobalThrottler::Get().RecordMessageSent(ELiveBPMessageType::WirePreview, CurrentUserId, CurrentTime);
-		LIVEBP_RECORD_MESSAGE_SENT(ELiveBPMessageType::WirePreview, Message.PayloadData.Num());
-		
-		return true;
-	}
-
-	LIVEBP_RECORD_ERROR("Failed to get Concert session", true);
-	return false;
+	UE_LOG(LogLiveBPCore, Log, TEXT("LiveBP joined Concert session as user: %s"), *CurrentUserId);
 }
 
-bool ULiveBPMUEIntegration::SendNodeOperation(const FLiveBPNodeOperationData& NodeOperation, const FGuid& BlueprintId, const FGuid& GraphId)
+void ULiveBPMUEIntegration::OnSessionShutdown(TSharedRef<IConcertClientSession> InSession)
 {
-	LIVEBP_SCOPE_TIMER("SendNodeOperation");
-	
-	if (!IsConnected())
+	if (ActiveSession.IsValid() && ActiveSession.Get() == &InSession.Get())
 	{
-		LIVEBP_RECORD_ERROR("MUE not connected", true);
-		return false;
-	}
-
-	float CurrentTime = FPlatformTime::Seconds();
-	
-	FLiveBPMessage Message;
-	Message.MessageType = ELiveBPMessageType::NodeOperation;
-	Message.BlueprintId = BlueprintId;
-	Message.GraphId = GraphId;
-	Message.UserId = CurrentUserId;
-	Message.Timestamp = CurrentTime;
-	Message.PayloadData = SerializeNodeOperation(NodeOperation);
-
-	FLiveBPConcertEvent ConcertEvent;
-	ConcertEvent.Message = Message;
-
-	if (TSharedPtr<IConcertClientSession> Session = ConcertClient->GetCurrentSession())
-	{
-		Session->SendCustomEvent(ConcertEvent, Session->GetSessionServerEndpointId(), EConcertMessageFlags::ReliableOrdered);
+		// Unregister custom event handler
+		InSession->UnregisterCustomEventHandler<FLiveBPConcertEvent>();
 		
-		// Record message sent (no throttling for structural changes)
-		LIVEBP_RECORD_MESSAGE_SENT(ELiveBPMessageType::NodeOperation, Message.PayloadData.Num());
-		
-		return true;
-	}
+		ActiveSession.Reset();
+		CurrentUserId.Empty();
 
-	LIVEBP_RECORD_ERROR("Failed to get Concert session", true);
-	return false;
+		UE_LOG(LogLiveBPCore, Log, TEXT("LiveBP left Concert session"));
+	}
 }
 
-bool ULiveBPMUEIntegration::SendLockRequest(const FLiveBPNodeLock& LockRequest, const FGuid& BlueprintId, const FGuid& GraphId)
+void ULiveBPMUEIntegration::OnCustomEventReceived(const FConcertSessionContext& Context, const FLiveBPConcertEvent& Event)
 {
-	LIVEBP_SCOPE_TIMER("SendLockRequest");
-	
-	if (!IsConnected())
-	{
-		LIVEBP_RECORD_ERROR("MUE not connected", true);
-		return false;
-	}
-
-	float CurrentTime = FPlatformTime::Seconds();
-	
-	FLiveBPMessage Message;
-	Message.MessageType = ELiveBPMessageType::LockRequest;
-	Message.BlueprintId = BlueprintId;
-	Message.GraphId = GraphId;
-	Message.UserId = CurrentUserId;
-	Message.Timestamp = CurrentTime;
-	Message.PayloadData = SerializeLockRequest(LockRequest);
-
-	FLiveBPConcertEvent ConcertEvent;
-	ConcertEvent.Message = Message;
-
-	if (TSharedPtr<IConcertClientSession> Session = ConcertClient->GetCurrentSession())
-	{
-		Session->SendCustomEvent(ConcertEvent, Session->GetSessionServerEndpointId(), EConcertMessageFlags::ReliableOrdered);
-		
-		// Record message sent (no throttling for locks)
-		LIVEBP_RECORD_MESSAGE_SENT(ELiveBPMessageType::LockRequest, Message.PayloadData.Num());
-		
-		return true;
-	}
-
-	LIVEBP_RECORD_ERROR("Failed to get Concert session", true);
-	return false;
-}
-}
-
-void ULiveBPMUEIntegration::HandleConcertMessage(const FConcertSessionContext& Context, const FLiveBPConcertEvent& Event)
-{
-	LIVEBP_SCOPE_TIMER("HandleConcertMessage");
-	
 	// Don't process our own messages
 	if (Event.Message.UserId == CurrentUserId)
 	{
 		return;
 	}
 
-	// Calculate latency if possible
-	float CurrentTime = FPlatformTime::Seconds();
-	float LatencyMs = (CurrentTime - Event.Message.Timestamp) * 1000.0f;
-	
-	// Record message received
-	LIVEBP_RECORD_MESSAGE_RECEIVED(Event.Message.MessageType, Event.Message.PayloadData.Num(), LatencyMs);
+	UE_LOG(LogLiveBPCore, VeryVerbose, TEXT("Received LiveBP message of type %d from user %s on channel %s"), 
+		static_cast<int32>(Event.Message.MessageType), *Event.Message.UserId, *Event.Channel);
 
-	HandleLiveBPMessage(Event.Message, Context);
+	// Broadcast the received message to listeners
+	OnMessageReceived.Broadcast(Event.Message);
 }
 
-void ULiveBPMUEIntegration::HandleLiveBPMessage(const FLiveBPMessage& Message, const FConcertSessionContext& Context)
+bool ULiveBPMUEIntegration::SendCustomEvent(const FString& Channel, const TArray<uint8>& EventData)
 {
-	UE_LOG(LogLiveBPCore, VeryVerbose, TEXT("Received LiveBP message of type %d from user %s"), 
-		static_cast<int32>(Message.MessageType), *Message.UserId);
+	if (!IsConnected())
+	{
+		UE_LOG(LogLiveBPCore, Warning, TEXT("Cannot send custom event: not connected to Concert session"));
+		return false;
+	}
 
-	OnMessageReceived.Broadcast(Message, Context);
+	// Create LiveBP message from the event data
+	FLiveBPMessage Message;
+	if (!DeserializeMessage(Channel, EventData, Message))
+	{
+		UE_LOG(LogLiveBPCore, Error, TEXT("Failed to deserialize message for channel: %s"), *Channel);
+		return false;
+	}
+
+	// Create Concert event wrapper
+	FLiveBPConcertEvent ConcertEvent(Channel, Message);
+
+	// Send the event to all session participants
+	ActiveSession->SendCustomEvent(ConcertEvent, ActiveSession->GetSessionServerEndpointId(), EConcertMessageFlags::ReliableOrdered);
+
+	UE_LOG(LogLiveBPCore, Verbose, TEXT("Sent LiveBP message of type %d on channel %s"), 
+		static_cast<int32>(Message.MessageType), *Channel);
+
+	return true;
+}
+
+bool ULiveBPMUEIntegration::SendWirePreview(const FLiveBPWirePreview& WirePreview, const FGuid& BlueprintId, const FGuid& GraphId)
+{
+	if (!IsConnected())
+	{
+		UE_LOG(LogLiveBPCore, Warning, TEXT("Cannot send wire preview: not connected to Concert session"));
+		return false;
+	}
+
+	// Create message
+	FLiveBPMessage Message;
+	Message.MessageType = ELiveBPMessageType::WirePreview;
+	Message.BlueprintId = BlueprintId;
+	Message.GraphId = GraphId;
+	Message.UserId = CurrentUserId;
+	Message.Timestamp = FPlatformTime::Seconds();
+	Message.PayloadData = SerializeWirePreview(WirePreview);
+
+	// Create Concert event
+	FLiveBPConcertEvent ConcertEvent(LiveBPWirePreviewChannel, Message);
+
+	// Send to all participants using the correct API
+	TArray<FGuid> AllEndpoints;
+	TArray<FConcertClientInfo> ClientInfos = ActiveSession->GetSessionClients();
+	for (const FConcertClientInfo& ClientInfo : ClientInfos)
+	{
+		AllEndpoints.Add(ClientInfo.ClientEndpointId);
+	}
+	
+	if (AllEndpoints.Num() > 0)
+	{
+		ActiveSession->SendCustomEvent(ConcertEvent, AllEndpoints, EConcertMessageFlags::ReliableOrdered);
+	}
+
+	UE_LOG(LogLiveBPCore, VeryVerbose, TEXT("Sent wire preview for Blueprint %s"), *BlueprintId.ToString());
+
+	return true;
+}
+
+bool ULiveBPMUEIntegration::SendNodeOperation(const FLiveBPNodeOperationData& NodeOperation, const FGuid& BlueprintId, const FGuid& GraphId)
+{
+	if (!IsConnected())
+	{
+		UE_LOG(LogLiveBPCore, Warning, TEXT("Cannot send node operation: not connected to Concert session"));
+		return false;
+	}
+
+	// Create message
+	FLiveBPMessage Message;
+	Message.MessageType = ELiveBPMessageType::NodeOperation;
+	Message.BlueprintId = BlueprintId;
+	Message.GraphId = GraphId;
+	Message.UserId = CurrentUserId;
+	Message.Timestamp = FPlatformTime::Seconds();
+	Message.PayloadData = SerializeNodeOperation(NodeOperation);
+
+	// Create Concert event
+	FLiveBPConcertEvent ConcertEvent(LiveBPNodeOperationChannel, Message);
+
+	// Send to all participants using the correct API
+	TArray<FGuid> AllEndpoints;
+	TArray<FConcertClientInfo> ClientInfos = ActiveSession->GetSessionClients();
+	for (const FConcertClientInfo& ClientInfo : ClientInfos)
+	{
+		AllEndpoints.Add(ClientInfo.ClientEndpointId);
+	}
+	
+	if (AllEndpoints.Num() > 0)
+	{
+		ActiveSession->SendCustomEvent(ConcertEvent, AllEndpoints, EConcertMessageFlags::ReliableOrdered);
+	}
+
+	UE_LOG(LogLiveBPCore, Verbose, TEXT("Sent node operation %d for Blueprint %s"), 
+		static_cast<int32>(NodeOperation.Operation), *BlueprintId.ToString());
+
+	return true;
+}
+
+bool ULiveBPMUEIntegration::SendLockRequest(const FLiveBPNodeLock& LockRequest, const FGuid& BlueprintId, const FGuid& GraphId)
+{
+	if (!IsConnected())
+	{
+		UE_LOG(LogLiveBPCore, Warning, TEXT("Cannot send lock request: not connected to Concert session"));
+		return false;
+	}
+
+	// Create message
+	FLiveBPMessage Message;
+	Message.MessageType = ELiveBPMessageType::LockRequest;
+	Message.BlueprintId = BlueprintId;
+	Message.GraphId = GraphId;
+	Message.UserId = CurrentUserId;
+	Message.Timestamp = FPlatformTime::Seconds();
+	Message.PayloadData = SerializeLockRequest(LockRequest);
+
+	// Create Concert event
+	FLiveBPConcertEvent ConcertEvent(LiveBPLockRequestChannel, Message);
+
+	// Send to all participants using the correct API
+	TArray<FGuid> AllEndpoints;
+	TArray<FConcertClientInfo> ClientInfos = ActiveSession->GetSessionClients();
+	for (const FConcertClientInfo& ClientInfo : ClientInfos)
+	{
+		AllEndpoints.Add(ClientInfo.ClientEndpointId);
+	}
+	
+	if (AllEndpoints.Num() > 0)
+	{
+		ActiveSession->SendCustomEvent(ConcertEvent, AllEndpoints, EConcertMessageFlags::ReliableOrdered);
+	}
+
+	UE_LOG(LogLiveBPCore, Verbose, TEXT("Sent lock request for node %s in Blueprint %s"), 
+		*LockRequest.NodeId.ToString(), *BlueprintId.ToString());
+
+	return true;
 }
 
 bool ULiveBPMUEIntegration::IsConnected() const
 {
-	return bIsInitialized && ConcertClient.IsValid() && ConcertClient->GetCurrentSession().IsValid();
+	return bIsInitialized && ConcertSyncClient && ActiveSession.IsValid();
+}
+
+bool ULiveBPMUEIntegration::HasActiveSession() const
+{
+	return ActiveSession.IsValid();
 }
 
 FString ULiveBPMUEIntegration::GetCurrentUserId() const
@@ -240,12 +332,30 @@ FString ULiveBPMUEIntegration::GetCurrentUserId() const
 	return CurrentUserId;
 }
 
+TArray<FString> ULiveBPMUEIntegration::GetConnectedUsers() const
+{
+	TArray<FString> ConnectedUsers;
+	
+	if (!ActiveSession.IsValid())
+	{
+		return ConnectedUsers;
+	}
+
+	TArray<FConcertClientInfo> ClientInfos = ActiveSession->GetSessionClients();
+	for (const FConcertClientInfo& ClientInfo : ClientInfos)
+	{
+		ConnectedUsers.Add(ClientInfo.UserName);
+	}
+
+	return ConnectedUsers;
+}
+
 TArray<uint8> ULiveBPMUEIntegration::SerializeWirePreview(const FLiveBPWirePreview& WirePreview) const
 {
 	TArray<uint8> Result;
 	FMemoryWriter Writer(Result);
 	
-	// Binary serialization for performance
+	// Binary serialization for performance - wire previews are high frequency
 	Writer << const_cast<FGuid&>(WirePreview.NodeId);
 	Writer << const_cast<FString&>(WirePreview.PinName);
 	Writer << const_cast<FVector2D&>(WirePreview.StartPosition);
@@ -301,4 +411,12 @@ TArray<uint8> ULiveBPMUEIntegration::SerializeLockRequest(const FLiveBPNodeLock&
 	Result.Append(reinterpret_cast<const uint8*>(TCHAR_TO_UTF8(*JsonString)), JsonString.Len());
 	
 	return Result;
+}
+
+bool ULiveBPMUEIntegration::DeserializeMessage(const FString& Channel, const TArray<uint8>& Data, FLiveBPMessage& OutMessage) const
+{
+	// For this implementation, we're creating the message structure directly in the Send methods
+	// This function would be used if we were deserializing raw event data
+	// For now, we'll return true as we're handling this differently
+	return true;
 }

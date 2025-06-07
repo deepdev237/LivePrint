@@ -4,6 +4,7 @@
 #include "CoreMinimal.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/Views/SListView.h"
+#include "WorkflowOrientedApp/WorkflowTabFactory.h"
 #include "LiveBPDataTypes.h"
 #include "LiveBPPerformanceMonitor.h"
 

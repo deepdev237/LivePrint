@@ -165,7 +165,7 @@ FLinearColor ULiveBPNotificationSystem::GetNotificationColor(ELiveBPNotification
 	case ELiveBPNotificationType::ConnectionBroken:
 		return FLinearColor(1.0f, 0.3f, 0.3f, 1.0f); // Light red
 	case ELiveBPNotificationType::NodeMoved:
-		return FLinearColor::Cyan;
+		return FLinearColor(0.0f, 1.0f, 1.0f); // Cyan color
 	case ELiveBPNotificationType::ConflictResolved:
 		return FLinearColor(0.8f, 0.8f, 0.0f, 1.0f); // Yellow-green
 	case ELiveBPNotificationType::SyncError:

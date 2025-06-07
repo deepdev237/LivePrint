@@ -200,8 +200,8 @@ private:
 	TMap<ELiveBPMessageType, FMessageStats> MessageTypeStats;
 	
 	// Latency tracking
-	TCircularBuffer<FLatencyMeasurement> LatencyHistory;
 	static const int32 MAX_LATENCY_SAMPLES = 100;
+	TCircularBuffer<FLatencyMeasurement, MAX_LATENCY_SAMPLES> LatencyHistory;
 	
 	// Error tracking
 	int32 TotalErrorCount;
@@ -210,14 +210,14 @@ private:
 	TMap<FString, int32> ErrorTypeCount;
 	
 	// Performance timing
-	TCircularBuffer<FTimingMeasurement> TimingHistory;
 	static const int32 MAX_TIMING_SAMPLES = 200;
+	TCircularBuffer<FTimingMeasurement, MAX_TIMING_SAMPLES> TimingHistory;
 	TMap<FString, TArray<float>> DetailedTimings;
 	
 	// Frame performance
-	TCircularBuffer<float> FrameTimeHistory;
-	TCircularBuffer<float> CollaborationOverheadHistory;
 	static const int32 MAX_FRAME_SAMPLES = 60;
+	TCircularBuffer<float, MAX_FRAME_SAMPLES> FrameTimeHistory;
+	TCircularBuffer<float, MAX_FRAME_SAMPLES> CollaborationOverheadHistory;
 	
 	// Session info
 	int32 CurrentConnectedUsers;
@@ -229,8 +229,8 @@ private:
 	int32 CurrentCachedUserCount;
 	
 	// Helper functions
-	float CalculateAverage(const TCircularBuffer<float>& History) const;
-	float CalculateStandardDeviation(const TCircularBuffer<FLatencyMeasurement>& History, float Average) const;
+	float CalculateAverage(const TCircularBuffer<float, MAX_FRAME_SAMPLES>& History) const;
+	float CalculateStandardDeviation(const TCircularBuffer<FLatencyMeasurement, MAX_LATENCY_SAMPLES>& History, float Average) const;
 	float GetCurrentTime() const;
 	void UpdateMessageRate();
 	float EstimateMemoryUsage() const;

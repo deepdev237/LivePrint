@@ -10,6 +10,7 @@
 	"DocsURL": "https://github.com/your-repo/live-blueprint-plugin/blob/main/README.md",
 	"MarketplaceURL": "",
 	"SupportURL": "https://github.com/your-repo/live-blueprint-plugin/issues",
+	"EngineVersion": "5.5.0",
 	"CanContainContent": false,
 	"IsBetaVersion": false,
 	"IsExperimentalVersion": true,
@@ -41,7 +42,11 @@
 			"Enabled": true
 		},
 		{
-			"Name": "MultiUserClient",
+			"Name": "ConcertSyncClient",
+			"Enabled": true
+		},
+		{
+			"Name": "MultiUserEditing",
 			"Enabled": true
 		}
 	]

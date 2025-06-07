@@ -45,7 +45,6 @@ private:
 	TMap<FGuid, FLiveBPNodeLock> NodeLocks;
 
 	// Pending lock requests (for conflict resolution)
-	UPROPERTY()
 	TMap<FGuid, TArray<FLiveBPNodeLock>> PendingLockRequests;
 
 	// Helper functions

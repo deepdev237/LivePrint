@@ -6,6 +6,10 @@ public class LiveBPEditor : ModuleRules
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		
+		// UE 5.5 compatibility settings
+		DefaultBuildSettings = BuildSettingsVersion.V5;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_5;
+		
 		bUseUnity = false;
 
 		PublicDependencyModuleNames.AddRange(
@@ -28,7 +32,6 @@ public class LiveBPEditor : ModuleRules
 				"PropertyEditor",
 				"GraphEditor",
 				"Kismet",
-				"BlueprintEditorModule",
 				// LiveBP Core
 				"LiveBPCore"
 			}
@@ -40,14 +43,21 @@ public class LiveBPEditor : ModuleRules
 				"InputCore",
 				"EditorSubsystem",
 				"DesktopPlatform",
-				"Framework",
 				"ApplicationCore",
+				"AssetRegistry", // For asset tracking
+				"ToolkitApplication", // For asset editor integration
 				// Rendering
 				"RenderCore",
 				"RHI",
 				// Serialization
 				"Json",
-				"JsonObjectConverter"
+				"JsonUtilities",
+				// Concert/MUE dependencies - using correct module names for UE 5.5
+				"Concert",
+				"ConcertSyncClient",
+				"ConcertSyncCore",
+				"ConcertTransport",
+				"ConcertMain"
 			}
 		);
 	}

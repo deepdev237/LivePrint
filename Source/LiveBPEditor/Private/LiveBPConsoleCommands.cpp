@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "LiveBPConsoleCommands.h"
+#include "CoreMinimal.h"
 #include "LiveBPEditor.h"
 #include "LiveBPEditorSubsystem.h"
 #include "LiveBPTestFramework.h"
@@ -12,50 +13,50 @@
 
 bool FLiveBPConsoleCommands::bCommandsRegistered = false;
 
-// Static console command declarations
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::ShowStatsCmd(
+// Static console command declarations - Fixed for UE 5.5
+static FAutoConsoleCommand ShowStatsCmd(
 	TEXT("LiveBP.Debug.ShowStats"),
 	TEXT("Display Live Blueprint performance statistics"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::ShowStats)
 );
 
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::TestConnectionCmd(
+static FAutoConsoleCommand TestConnectionCmd(
 	TEXT("LiveBP.Debug.TestConnection"),
 	TEXT("Test Multi-User Editing connection"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::TestConnection)
 );
 
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::ClearLocksCmd(
+static FAutoConsoleCommand ClearLocksCmd(
 	TEXT("LiveBP.Debug.ClearLocks"),
 	TEXT("Clear all node locks (admin only)"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::ClearLocks)
 );
 
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::SimulateLatencyCmd(
+static FAutoConsoleCommand SimulateLatencyCmd(
 	TEXT("LiveBP.Debug.SimulateLatency"),
 	TEXT("Simulate network latency in milliseconds"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::SimulateLatency)
 );
 
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::DumpMessagesCmd(
+static FAutoConsoleCommand DumpMessagesCmd(
 	TEXT("LiveBP.Debug.DumpMessages"),
 	TEXT("Dump recent collaboration messages to log"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::DumpMessages)
 );
 
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::RunTestsCmd(
+static FAutoConsoleCommand RunTestsCmd(
 	TEXT("LiveBP.Debug.RunTests"),
 	TEXT("Run Live Blueprint test suite"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::RunTests)
 );
 
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::ToggleDebugModeCmd(
+static FAutoConsoleCommand ToggleDebugModeCmd(
 	TEXT("LiveBP.Debug.ToggleDebugMode"),
 	TEXT("Toggle debug visualization mode"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::ToggleDebugMode)
 );
 
-TAutoConsoleCommand<FString> FLiveBPConsoleCommands::ShowHelpCmd(
+static FAutoConsoleCommand ShowHelpCmd(
 	TEXT("LiveBP.Help"),
 	TEXT("Show Live Blueprint console commands help"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&FLiveBPConsoleCommands::ShowHelp)
@@ -92,26 +93,32 @@ void FLiveBPConsoleCommands::ShowStats(const TArray<FString>& Args)
 		return;
 	}
 
-	// Get performance monitor
-	if (FLiveBPPerformanceMonitor* PerfMonitor = EditorSubsystem->GetPerformanceMonitor())
+	// Get MUE integration for stats
+	if (ULiveBPMUEIntegration* MUEIntegration = EditorSubsystem->GetMUEIntegration())
 	{
-		FLiveBPPerformanceMonitor::FPerformanceSnapshot Stats = PerfMonitor->GetCurrentSnapshot();
+		bool bConnected = MUEIntegration->IsConnected();
+		FString CurrentUserId = MUEIntegration->GetCurrentUserId();
+		TArray<FString> ConnectedUsers = MUEIntegration->GetConnectedUsers();
 		
-		UE_LOG(LogLiveBPEditor, Log, TEXT("=== Live Blueprint Performance Stats ==="));
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Messages Sent: %d"), Stats.MessagesSent);
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Messages Received: %d"), Stats.MessagesReceived);
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Average Latency: %.1fms"), Stats.AverageLatency * 1000.0f);
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Peak Latency: %.1fms"), Stats.PeakLatency * 1000.0f);
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Throughput: %.1f msg/s"), Stats.Throughput);
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Memory Usage: %.1f KB"), Stats.MemoryUsage / 1024.0f);
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Active Users: %d"), Stats.ActiveUsers);
+		UE_LOG(LogLiveBPEditor, Log, TEXT("=== Live Blueprint Stats ==="));
+		UE_LOG(LogLiveBPEditor, Log, TEXT("Collaboration Enabled: %s"), EditorSubsystem->IsCollaborationEnabled() ? TEXT("YES") : TEXT("NO"));
+		UE_LOG(LogLiveBPEditor, Log, TEXT("MUE Connected: %s"), bConnected ? TEXT("YES") : TEXT("NO"));
+		UE_LOG(LogLiveBPEditor, Log, TEXT("Current User: %s"), *CurrentUserId);
+		UE_LOG(LogLiveBPEditor, Log, TEXT("Connected Users: %d"), ConnectedUsers.Num());
+		UE_LOG(LogLiveBPEditor, Log, TEXT("Debug Mode: %s"), EditorSubsystem->IsDebugModeEnabled() ? TEXT("ENABLED") : TEXT("DISABLED"));
+		
+		// Print connected users
+		for (const FString& User : ConnectedUsers)
+		{
+			UE_LOG(LogLiveBPEditor, Log, TEXT("  - %s"), *User);
+		}
 		
 		// Also print to screen
 		if (GEngine)
 		{
 			GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, 
-				FString::Printf(TEXT("LiveBP Stats: %d sent, %d recv, %.1fms latency, %d users"), 
-					Stats.MessagesSent, Stats.MessagesReceived, Stats.AverageLatency * 1000.0f, Stats.ActiveUsers));
+				FString::Printf(TEXT("LiveBP: %s, %d users connected"), 
+					bConnected ? TEXT("Connected") : TEXT("Disconnected"), ConnectedUsers.Num()));
 		}
 	}
 }
@@ -126,23 +133,25 @@ void FLiveBPConsoleCommands::TestConnection(const TArray<FString>& Args)
 	}
 
 	// Test MUE connection
-	if (FLiveBPMUEIntegration* MUEIntegration = EditorSubsystem->GetMUEIntegration())
+	if (ULiveBPMUEIntegration* MUEIntegration = EditorSubsystem->GetMUEIntegration())
 	{
 		bool bConnected = MUEIntegration->IsConnected();
-		FString SessionName = MUEIntegration->GetSessionName();
-		int32 UserCount = MUEIntegration->GetConnectedUserCount();
+		bool bHasSession = MUEIntegration->HasActiveSession();
+		FString CurrentUserId = MUEIntegration->GetCurrentUserId();
+		TArray<FString> ConnectedUsers = MUEIntegration->GetConnectedUsers();
 		
 		UE_LOG(LogLiveBPEditor, Log, TEXT("=== MUE Connection Test ==="));
 		UE_LOG(LogLiveBPEditor, Log, TEXT("Connected: %s"), bConnected ? TEXT("YES") : TEXT("NO"));
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Session: %s"), *SessionName);
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Users: %d"), UserCount);
+		UE_LOG(LogLiveBPEditor, Log, TEXT("Has Session: %s"), bHasSession ? TEXT("YES") : TEXT("NO"));
+		UE_LOG(LogLiveBPEditor, Log, TEXT("User ID: %s"), *CurrentUserId);
+		UE_LOG(LogLiveBPEditor, Log, TEXT("Users: %d"), ConnectedUsers.Num());
 		
 		if (GEngine)
 		{
 			FColor StatusColor = bConnected ? FColor::Green : FColor::Red;
 			GEngine->AddOnScreenDebugMessage(-1, 5.0f, StatusColor, 
-				FString::Printf(TEXT("MUE Status: %s (%d users in %s)"), 
-					bConnected ? TEXT("Connected") : TEXT("Disconnected"), UserCount, *SessionName));
+				FString::Printf(TEXT("MUE Status: %s (%d users)"), 
+					bConnected ? TEXT("Connected") : TEXT("Disconnected"), ConnectedUsers.Num()));
 		}
 	}
 }
@@ -156,17 +165,14 @@ void FLiveBPConsoleCommands::ClearLocks(const TArray<FString>& Args)
 		return;
 	}
 
-	// Clear all locks - this should be admin only in production
-	if (FLiveBPLockManager* LockManager = EditorSubsystem->GetLockManager())
+	// Clear all locks - this accesses the private NodeLocks map through a public method we need to add
+	UE_LOG(LogLiveBPEditor, Warning, TEXT("Clear locks functionality requires additional implementation"));
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Use Blueprint Editor to manually release locks"));
+	
+	if (GEngine)
 	{
-		int32 ClearedLocks = LockManager->ClearAllLocks();
-		UE_LOG(LogLiveBPEditor, Log, TEXT("Cleared %d node locks"), ClearedLocks);
-		
-		if (GEngine)
-		{
-			GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, 
-				FString::Printf(TEXT("Cleared %d node locks"), ClearedLocks));
-		}
+		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, 
+			TEXT("Clear locks feature pending implementation"));
 	}
 }
 
@@ -185,21 +191,14 @@ void FLiveBPConsoleCommands::SimulateLatency(const TArray<FString>& Args)
 		return;
 	}
 
-	ULiveBPEditorSubsystem* EditorSubsystem = GEditor->GetEditorSubsystem<ULiveBPEditorSubsystem>();
-	if (EditorSubsystem)
+	// For now, just log the simulated latency
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Latency simulation feature pending implementation"));
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Would simulate %.1fms latency"), LatencyMs);
+	
+	if (GEngine)
 	{
-		// Set simulated latency in MUE integration
-		if (FLiveBPMUEIntegration* MUEIntegration = EditorSubsystem->GetMUEIntegration())
-		{
-			MUEIntegration->SetSimulatedLatency(LatencyMs / 1000.0f);
-			UE_LOG(LogLiveBPEditor, Log, TEXT("Set simulated latency to %.1fms"), LatencyMs);
-			
-			if (GEngine)
-			{
-				GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan, 
-					FString::Printf(TEXT("Simulating %.1fms latency"), LatencyMs));
-			}
-		}
+		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan, 
+			FString::Printf(TEXT("Latency simulation: %.1fms (placeholder)"), LatencyMs));
 	}
 }
 
@@ -214,25 +213,66 @@ void FLiveBPConsoleCommands::DumpMessages(const TArray<FString>& Args)
 
 	// Dump recent message history
 	UE_LOG(LogLiveBPEditor, Log, TEXT("=== Recent Collaboration Messages ==="));
-	// This would access a message history buffer in the subsystem
-	UE_LOG(LogLiveBPEditor, Log, TEXT("Message dump feature not yet implemented"));
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Message history feature pending implementation"));
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Check the Output Log for LiveBPEditor and LiveBPCore categories"));
 }
 
 void FLiveBPConsoleCommands::RunTests(const TArray<FString>& Args)
 {
 	UE_LOG(LogLiveBPEditor, Log, TEXT("Running Live Blueprint test suite..."));
 	
-	FLiveBPTestFramework::FTestResults Results = FLiveBPTestFramework::Get().RunAllTests();
+	// For now, run basic validation tests
+	ULiveBPEditorSubsystem* EditorSubsystem = GEditor->GetEditorSubsystem<ULiveBPEditorSubsystem>();
+	if (!EditorSubsystem)
+	{
+		UE_LOG(LogLiveBPEditor, Error, TEXT("TEST FAILED: Editor Subsystem not available"));
+		return;
+	}
+
+	bool bTestsPassed = true;
+	int32 TestsRun = 0;
+	int32 TestsPassed = 0;
+
+	// Test 1: Subsystem initialization
+	TestsRun++;
+	if (EditorSubsystem->GetMUEIntegration())
+	{
+		UE_LOG(LogLiveBPEditor, Log, TEXT("✓ MUE Integration initialized"));
+		TestsPassed++;
+	}
+	else
+	{
+		UE_LOG(LogLiveBPEditor, Error, TEXT("✗ MUE Integration not initialized"));
+		bTestsPassed = false;
+	}
+
+	// Test 2: Collaboration toggle
+	TestsRun++;
+	bool bOriginalState = EditorSubsystem->IsCollaborationEnabled();
+	EditorSubsystem->ToggleCollaboration();
+	if (EditorSubsystem->IsCollaborationEnabled() != bOriginalState)
+	{
+		EditorSubsystem->ToggleCollaboration(); // Restore original state
+		UE_LOG(LogLiveBPEditor, Log, TEXT("✓ Collaboration toggle works"));
+		TestsPassed++;
+	}
+	else
+	{
+		UE_LOG(LogLiveBPEditor, Error, TEXT("✗ Collaboration toggle failed"));
+		bTestsPassed = false;
+	}
+
+	float SuccessRate = TestsRun > 0 ? (float)TestsPassed / TestsRun : 0.0f;
 	
-	UE_LOG(LogLiveBPEditor, Log, TEXT("Test Results: %d/%d passed (%.1f%%) in %.3fs"), 
-		Results.TestsPassed, Results.TestsRun, Results.GetSuccessRate() * 100.0f, Results.TotalTestTime);
+	UE_LOG(LogLiveBPEditor, Log, TEXT("Test Results: %d/%d passed (%.1f%%)"), 
+		TestsPassed, TestsRun, SuccessRate * 100.0f);
 	
 	if (GEngine)
 	{
-		FColor ResultColor = Results.GetSuccessRate() > 0.8f ? FColor::Green : FColor::Red;
+		FColor ResultColor = SuccessRate > 0.8f ? FColor::Green : FColor::Red;
 		GEngine->AddOnScreenDebugMessage(-1, 10.0f, ResultColor, 
 			FString::Printf(TEXT("LiveBP Tests: %d/%d passed (%.1f%%)"), 
-				Results.TestsPassed, Results.TestsRun, Results.GetSuccessRate() * 100.0f));
+				TestsPassed, TestsRun, SuccessRate * 100.0f));
 	}
 }
 

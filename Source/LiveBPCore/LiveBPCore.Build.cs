@@ -6,6 +6,10 @@ public class LiveBPCore : ModuleRules
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		
+		// UE 5.5 compatibility settings
+		DefaultBuildSettings = BuildSettingsVersion.V5;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_5;
+		
 		bUseUnity = false;
 		
 		PublicIncludePaths.AddRange(
@@ -25,12 +29,7 @@ public class LiveBPCore : ModuleRules
 				"CoreUObject",
 				"Engine",
 				"Slate",
-				"SlateCore",
-				// Concert/MUE modules
-				"Concert",
-				"ConcertSyncCore",
-				"ConcertTransport",
-				"MultiUserClientLibrary"
+				"SlateCore"
 			}
 		);
 
@@ -38,12 +37,19 @@ public class LiveBPCore : ModuleRules
 			new string[]
 			{
 				"Json",
-				"JsonObjectConverter",
+				"JsonUtilities",
 				"Serialization",
 				"Networking",
 				"Sockets",
 				"ApplicationCore", // For timers and threading
-				"RHI" // For performance monitoring
+				"RHI", // For performance monitoring
+				"Projects", // For project settings
+				// Concert/MUE dependencies - using correct module names for UE 5.5
+				"Concert",
+				"ConcertSyncClient",
+				"ConcertSyncCore",
+				"ConcertTransport",
+				"ConcertMain"
 			}
 		);
 

@@ -28,13 +28,13 @@ FLiveBPPerformanceMonitor::FScopeTimer::~FScopeTimer()
 FLiveBPPerformanceMonitor::FLiveBPPerformanceMonitor()
 	: bIsMonitoring(false)
 	, SessionStartTime(0.0f)
-	, LatencyHistory(MAX_LATENCY_SAMPLES)
+	, LatencyHistory()
 	, TotalErrorCount(0)
 	, NetworkErrorCount(0)
 	, SerializationErrorCount(0)
-	, TimingHistory(MAX_TIMING_SAMPLES)
-	, FrameTimeHistory(MAX_FRAME_SAMPLES)
-	, CollaborationOverheadHistory(MAX_FRAME_SAMPLES)
+	, TimingHistory()
+	, FrameTimeHistory()
+	, CollaborationOverheadHistory()
 	, CurrentConnectedUsers(0)
 	, bIsSessionActive(false)
 	, CurrentMessageQueueSize(0)
@@ -377,7 +377,7 @@ TUniquePtr<FLiveBPPerformanceMonitor::FScopeTimer> FLiveBPPerformanceMonitor::Cr
 	return nullptr;
 }
 
-float FLiveBPPerformanceMonitor::CalculateAverage(const TCircularBuffer<float>& History) const
+float FLiveBPPerformanceMonitor::CalculateAverage(const TCircularBuffer<float, MAX_FRAME_SAMPLES>& History) const
 {
 	if (History.Num() == 0)
 		return 0.0f;
@@ -391,7 +391,7 @@ float FLiveBPPerformanceMonitor::CalculateAverage(const TCircularBuffer<float>& 
 	return Total / History.Num();
 }
 
-float FLiveBPPerformanceMonitor::CalculateStandardDeviation(const TCircularBuffer<FLatencyMeasurement>& History, float Average) const
+float FLiveBPPerformanceMonitor::CalculateStandardDeviation(const TCircularBuffer<FLatencyMeasurement, MAX_LATENCY_SAMPLES>& History, float Average) const
 {
 	if (History.Num() <= 1)
 		return 0.0f;
